@@ -1,4 +1,3 @@
-#Requires -Modules PnP.PowerShell
 <#
 .SYNOPSIS
     SharePoint Permission Scanner - Generates a detailed HTML report of all permissions
@@ -99,8 +98,22 @@ param(
     [Parameter()]
     [string]$Thumbprint,
 
+
     [Parameter()]
-    [string]$Tenant
+    [string]$ClientSecret,
+    # Alternative au certificat : client secret Azure AD
+    [Parameter()]
+    [string]$Tenant,
+
+    [Parameter()]
+    [string]$FocusUser,
+    # Filtrer par utilisateur/groupe : ne retourne que les objets ou ce principal a acces
+    # Ex: -FocusUser "john.doe@contoso.com"
+
+    [Parameter()]
+    [string]$CompareWith
+    # CSV d un scan precedent pour comparaison avant/apres
+    # Ex: -CompareWith ".\SPPermissions_20260501.csv"
 )
 
 Set-StrictMode -Version Latest
@@ -180,7 +193,11 @@ function Connect-ToSite {
     param([string]$Url)
     Write-Log "Connecting to: $Url" -Level INFO
     try {
-        if ($ClientId -and $Thumbprint -and $Tenant) {
+        if ($ClientId -and $ClientSecret -and $Tenant) {
+            # Authentification par Client Secret (pas de certificat requis)
+            Write-Log "Auth: Client Secret" -Level INFO
+            Connect-PnPOnline -Url $Url -ClientId $ClientId -ClientSecret $ClientSecret -Tenant $Tenant -ErrorAction Stop
+        } elseif ($ClientId -and $Thumbprint -and $Tenant) {
             # Verify certificate exists in store
             $cert = Get-Item "Cert:\CurrentUser\My\$Thumbprint" -ErrorAction SilentlyContinue
             if (-not $cert) {
@@ -229,11 +246,16 @@ function Invoke-ScanItem {
     )
     try {
         $hasUnique = $Item.HasUniqueRoleAssignments
-        # Charger toujours les permissions effectives (heritees ou uniques)
-        $perms = Get-SPPermissions -SecurableObject $Item
         $name = if ($Item.FieldValues["FileLeafRef"]) { $Item.FieldValues["FileLeafRef"] } else { $Item.FieldValues["Title"] }
         $ref  = $Item.FieldValues["FileRef"]
         $url  = if ($ref) { "$SiteUrl$ref" } else { $SiteUrl }
+
+        # Charger les permissions uniquement si l item a des permissions uniques
+        # Si herite, ses permissions = parent -> pas besoin de charger (et on ne devrait
+        # pas arriver ici grace au filtrage dans Invoke-ScanList)
+        $perms = if ($hasUnique) {
+            Get-SPPermissions -SecurableObject $Item
+        } else { @() }
 
         Add-Result -SiteUrl $SiteUrl -SiteName $SiteName `
             -ObjectType $ObjectType -ObjectName $name `
@@ -276,17 +298,65 @@ function Invoke-ScanList {
 
         # Scanner les items selon le ScanDepth
         if ($ScanDepth -eq "Full" -and $List.BaseType -eq "DocumentLibrary") {
-            $items = Get-PnPListItem -List $List.Id `
-                -Fields "FileLeafRef","FileRef","FSObjType" `
-                -Includes HasUniqueRoleAssignments `
-                -PageSize 500
-            Write-Log "    $($items.Count) items dans $($List.Title)" -Level INFO
-            foreach ($item in $items) {
-                $fsoType  = $item.FieldValues["FSObjType"]
-                $itemType = if ($fsoType -eq 1) { "Folder" } else { "File" }
-                Invoke-ScanItem -SiteUrl $SiteUrl -SiteName $SiteName `
-                    -ListTitle $List.Title -Item $item `
-                    -ParentName $List.Title -ObjectType $itemType
+
+            # Optimisation : si la librairie herite du site, ses items heritent aussi en cascade.
+            # Inutile de scanner chaque item — on saute directement.
+            if (-not $hasUnique) {
+                Write-Log "    [SKIP] $($List.Title) herite ses permissions - items non scannes." -Level INFO
+            } else {
+                # La librairie a des permissions uniques : recuperer les items via REST
+                # (HasUniqueRoleAssignments disponible en un seul appel REST, pas via -Includes PnP)
+                $listId   = $List.Id
+                $restUrl  = "/_api/web/lists(guid'$listId')/items?" +
+                            "`$select=Id,FileLeafRef,FileRef,FSObjType,HasUniqueRoleAssignments" +
+                            "&`$top=5000"
+
+                try {
+                    $restResult  = Invoke-PnPSPRestMethod -Url $restUrl -Method Get
+                    $allItems    = @($restResult.value)
+                    $uniqueItems = @($allItems | Where-Object { $_.HasUniqueRoleAssignments -eq $true })
+                } catch {
+                    # Fallback : Get-PnPListItem sans HasUniqueRoleAssignments, puis check individuel
+                    Write-Log "    REST fallback: $_ - utilisation de Get-PnPListItem" -Level WARN
+                    $pnpItems    = @(Get-PnPListItem -List $List.Id `
+                        -Fields "FileLeafRef","FileRef","FSObjType" -PageSize 500)
+                    $allItems    = $pnpItems
+                    # Charger HasUniqueRoleAssignments item par item (plus lent)
+                    $uniqueItems = @($pnpItems | Where-Object {
+                        try {
+                            Get-PnPProperty -ClientObject $_ -Property HasUniqueRoleAssignments | Out-Null
+                            $_.HasUniqueRoleAssignments
+                        } catch { $false }
+                    })
+                }
+
+                $totalItems = $allItems.Count
+                Write-Log "    $totalItems items dans $($List.Title) - $($uniqueItems.Count) avec permissions uniques" -Level INFO
+
+                if ($uniqueItems.Count -eq 0) {
+                    Write-Log "    [SKIP] Aucun item avec permissions uniques." -Level INFO
+                } else {
+                    foreach ($item in $uniqueItems) {
+                        # Reconstruire un objet compatible avec Invoke-ScanItem
+                        # REST renvoie des hashtables, PnP renvoie des ListItem
+                        if ($item -is [System.Collections.Hashtable] -or $item.PSObject.Properties["FileLeafRef"]) {
+                            # Objet REST - charger via Get-PnPListItem pour avoir le bon type
+                            $pnpItem = Get-PnPListItem -List $List.Id -Id $item.Id `
+                                -Includes HasUniqueRoleAssignments, RoleAssignments
+                            $fsoType  = $item.FSObjType
+                            $itemType = if ($fsoType -eq 1) { "Folder" } else { "File" }
+                            Invoke-ScanItem -SiteUrl $SiteUrl -SiteName $SiteName `
+                                -ListTitle $List.Title -Item $pnpItem `
+                                -ParentName $List.Title -ObjectType $itemType
+                        } else {
+                            $fsoType  = $item.FieldValues["FSObjType"]
+                            $itemType = if ($fsoType -eq 1) { "Folder" } else { "File" }
+                            Invoke-ScanItem -SiteUrl $SiteUrl -SiteName $SiteName `
+                                -ListTitle $List.Title -Item $item `
+                                -ParentName $List.Title -ObjectType $itemType
+                        }
+                    }
+                }
             }
         }
     } catch {
@@ -364,14 +434,42 @@ function Invoke-ScanSite {
 }
 #endregion
 
+
 #region ── REPORT ──
 
+# ── Detection des risques ──────────────────────────────────────────────────────
+function Get-RiskLevel {
+    param([string]$Principal, [string]$LoginName, [string]$PermLevel, [string]$PrincipalType)
+    $risks = @()
+    if ($LoginName -match 'spo-grid-all-users|everyone except external|c:0\(.s\|true' -or
+        $Principal -match '^Everyone|^All Users|^Tout le monde') {
+        $risks += 'CRITIQUE: Acces public (Everyone)'
+    }
+    if ($LoginName -match '#ext#|urn:spo:guest') {
+        $risks += 'ELEVE: Utilisateur externe'
+    }
+    if ($PermLevel -match 'Full Control' -and $PrincipalType -eq 'User') {
+        $risks += 'ELEVE: Full Control direct sur un utilisateur'
+    }
+    if ($PermLevel -match 'Full Control' -and $PrincipalType -eq 'Security Group') {
+        $risks += 'MOYEN: Full Control via groupe de securite'
+    }
+    if ($PermLevel -match 'Design|Edit' -and $PrincipalType -eq 'User') {
+        $risks += 'MOYEN: Permission Edit/Design directe sur un utilisateur'
+    }
+    if ($risks.Count -eq 0) { return 'OK' }
+    return ($risks -join ' | ')
+}
+
+# ── Export CSV ─────────────────────────────────────────────────────────────────
 function Export-CsvReport {
     param([string]$CsvPath)
     $rows = [System.Collections.Generic.List[PSCustomObject]]::new()
     foreach ($r in $Script:ScanResults) {
         if ($r.Permissions -and $r.Permissions.Count -gt 0) {
             foreach ($p in $r.Permissions) {
+                $risk = Get-RiskLevel -Principal $p.Principal -LoginName $p.LoginName `
+                    -PermLevel $p.PermLevel -PrincipalType $p.PrincipalType
                 $rows.Add([PSCustomObject]@{
                     SiteName             = $r.SiteName
                     SiteUrl              = $r.SiteUrl
@@ -384,6 +482,7 @@ function Export-CsvReport {
                     LoginName            = $p.LoginName
                     PrincipalType        = $p.PrincipalType
                     PermissionLevel      = $p.PermLevel
+                    Risk                 = $risk
                     ScannedAt            = $r.ScannedAt
                 })
             }
@@ -396,114 +495,183 @@ function Export-CsvReport {
                 ObjectUrl            = $r.ObjectUrl
                 HasUniquePermissions = $r.HasUniquePermissions
                 InheritedFrom        = $r.InheritedFrom
-                Principal            = ''
-                LoginName            = ''
-                PrincipalType        = ''
-                PermissionLevel      = $(if ($r.HasUniquePermissions) { '(no assignments)' } else { '(inherited)' })
+                Principal            = ""
+                LoginName            = ""
+                PrincipalType        = ""
+                PermissionLevel      = $(if ($r.HasUniquePermissions) { "(no assignments)" } else { "(inherited)" })
+                Risk                 = "OK"
                 ScannedAt            = $r.ScannedAt
             })
         }
     }
+    if ($FocusUser) {
+        $rows = [System.Collections.Generic.List[PSCustomObject]]($rows | Where-Object {
+            $_.Principal -like "*$FocusUser*" -or $_.LoginName -like "*$FocusUser*"
+        })
+        Write-Log "FocusUser '$FocusUser' : $($rows.Count) lignes" -Level INFO
+    }
     $rows | Export-Csv -Path $CsvPath -Encoding UTF8 -NoTypeInformation -Force
-    Write-Log "CSV exported: $CsvPath ($($rows.Count) rows)" -Level OK
+    Write-Log "CSV : $CsvPath ($($rows.Count) lignes)" -Level OK
     return $rows
 }
 
+# ── Comparaison ────────────────────────────────────────────────────────────────
+function Get-Comparison {
+    param([string]$PreviousCsv, [string]$CurrentCsv)
+    if (-not (Test-Path $PreviousCsv)) {
+        Write-Log "CSV precedent introuvable : $PreviousCsv" -Level WARN
+        return $null
+    }
+    Write-Log "Comparaison avec : $PreviousCsv" -Level INFO
+    $prev = Import-Csv $PreviousCsv
+    $curr = Import-Csv $CurrentCsv
+    $prevKeys = @{}; foreach ($r in $prev) { $prevKeys["$($r.SiteUrl)|$($r.ObjectUrl)|$($r.Principal)|$($r.PermissionLevel)"] = $r }
+    $currKeys = @{}; foreach ($r in $curr) { $currKeys["$($r.SiteUrl)|$($r.ObjectUrl)|$($r.Principal)|$($r.PermissionLevel)"] = $r }
+    $added   = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $removed = [System.Collections.Generic.List[PSCustomObject]]::new()
+    foreach ($k in $currKeys.Keys) { if (-not $prevKeys.ContainsKey($k)) { $added.Add($currKeys[$k]) } }
+    foreach ($k in $prevKeys.Keys) { if (-not $currKeys.ContainsKey($k)) { $removed.Add($prevKeys[$k]) } }
+    Write-Log "Diff : +$($added.Count) / -$($removed.Count)" -Level OK
+    return @{ Added = $added; Removed = $removed }
+}
+
+# ── Rapport HTML ───────────────────────────────────────────────────────────────
 function New-HtmlReport {
     Write-Log "Generating report..." -Level INFO
-
     $scanDuration = [math]::Round(((Get-Date) - $Script:StartTime).TotalSeconds, 1)
     $genDate      = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $uniqueCount  = @($Script:ScanResults | Where-Object { $_.HasUniquePermissions }).Count
     $siteCount    = @($Script:ScanResults | Where-Object { $_.ObjectType -eq "Site" }).Count
     $errorCount   = $Script:ScanErrors.Count
-    $csvPath      = $OutputPath -replace '\.html$', '.csv'
+    $csvPath      = $OutputPath -replace "\.html$", ".csv"
 
-    # 1. Ecrire le CSV
-    $csvRows = [System.Collections.Generic.List[PSCustomObject]]::new()
-    foreach ($r in $Script:ScanResults) {
-        if ($r.Permissions -and $r.Permissions.Count -gt 0) {
-            foreach ($p in $r.Permissions) {
-                $csvRows.Add([PSCustomObject]@{
-                    SiteName             = $r.SiteName
-                    SiteUrl              = $r.SiteUrl
-                    ObjectType           = $r.ObjectType
-                    ObjectName           = $r.ObjectName
-                    ObjectUrl            = $r.ObjectUrl
-                    HasUniquePermissions = $r.HasUniquePermissions
-                    InheritedFrom        = $r.InheritedFrom
-                    Principal            = $p.Principal
-                    LoginName            = $p.LoginName
-                    PrincipalType        = $p.PrincipalType
-                    PermissionLevel      = $p.PermLevel
-                })
-            }
-        } else {
-            $csvRows.Add([PSCustomObject]@{
-                SiteName             = $r.SiteName
-                SiteUrl              = $r.SiteUrl
-                ObjectType           = $r.ObjectType
-                ObjectName           = $r.ObjectName
-                ObjectUrl            = $r.ObjectUrl
-                HasUniquePermissions = $r.HasUniquePermissions
-                InheritedFrom        = $r.InheritedFrom
-                Principal            = ""
-                LoginName            = ""
-                PrincipalType        = ""
-                PermissionLevel      = $(if ($r.HasUniquePermissions) { "(no assignments)" } else { "(inherited)" })
-            })
+    # 1. Export CSV
+    $rows = Export-CsvReport -CsvPath $csvPath
+
+    # 2. Comparaison
+    $addedJson   = "[]"
+    $removedJson = "[]"
+    $hasCompare  = "false"
+    $addedCount  = 0
+    $removedCount= 0
+    if ($CompareWith) {
+        $diff = Get-Comparison -PreviousCsv $CompareWith -CurrentCsv $csvPath
+        if ($diff) {
+            $hasCompare   = "true"
+            $addedCount   = $diff.Added.Count
+            $removedCount = $diff.Removed.Count
+            if ($addedCount   -gt 0) { $addedJson   = $diff.Added   | ConvertTo-Json -Compress -Depth 2 }
+            if ($removedCount -gt 0) { $removedJson = $diff.Removed | ConvertTo-Json -Compress -Depth 2 }
+            $diffCsv = $OutputPath -replace "\.html$", "_diff.csv"
+            (@($diff.Added) + @($diff.Removed)) | Export-Csv $diffCsv -Encoding UTF8 -NoTypeInformation -Force
+            Write-Log "Diff CSV : $diffCsv" -Level OK
         }
     }
-    $csvRows | Export-Csv -Path $csvPath -Encoding UTF8 -NoTypeInformation -Force
-    Write-Log "CSV : $csvPath ($($csvRows.Count) lignes)" -Level OK
 
-    # 2. Relire le CSV - methode eprouvee
-    $data = Import-Csv -Path $csvPath
+    # 3. Relire CSV (methode eprouvee)
+    $data        = Import-Csv -Path $csvPath
+    $critCount   = @($data | Where-Object { $_.Risk -like "CRITIQUE*" }).Count
+    $highCount   = @($data | Where-Object { $_.Risk -like "ELEVE*" }).Count
+    $medCount    = @($data | Where-Object { $_.Risk -like "MOYEN*" }).Count
+    $totalRows   = $data.Count
+    $focusLabel  = if ($FocusUser) { " | Focus: $FocusUser" } else { "" }
+    $riskTotal   = $critCount + $highCount + $medCount
+    $compareTabDisplay = if ($CompareWith) { "" } else { " style=`"display:none`"" }
 
-    # 3. CSS - single-quoted, aucune interpolation PS
+    # 4. CSS
     $css = @'
 <meta charset="UTF-8">
 <style>
-body{font-family:Segoe UI,Arial,sans-serif;background:#0f1117;color:#e2e8f0;font-size:13px;margin:0}
-.hdr{background:linear-gradient(135deg,#0d1525,#0f1117);border-bottom:2px solid #1c2540;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
-.logo{width:34px;height:34px;background:linear-gradient(135deg,#2563eb,#7c3aed);border-radius:8px;display:inline-flex;align-items:center;justify-content:center;font-weight:800;color:#fff;font-size:14px;margin-right:10px;vertical-align:middle}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:Segoe UI,Arial,sans-serif;background:#080c14;color:#e2e8f0;font-size:13px}
+.hdr{background:linear-gradient(135deg,#0d1525,#080c14);border-bottom:2px solid #1c2540;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
+.logo{width:34px;height:34px;background:linear-gradient(135deg,#2563eb,#7c3aed);border-radius:8px;display:inline-flex;align-items:center;justify-content:center;font-weight:800;color:#fff;font-size:14px;margin-right:10px;vertical-align:middle;box-shadow:0 0 16px rgba(37,99,235,.4)}
 .brand{font-size:16px;font-weight:700;color:#e2e8f0}.brand b{color:#60a5fa}
 .sub{font-size:10px;color:#4a5568;font-family:Consolas,monospace;margin-top:2px}
 .stats{display:flex;gap:4px;flex-wrap:wrap}
-.stat{background:#161b27;padding:6px 14px;text-align:center;border:1px solid #1c2540;border-radius:4px}
+.stat{background:#0d1220;padding:6px 14px;text-align:center;border:1px solid #1c2540;border-radius:4px}
 .sn{font-size:17px;font-weight:700;line-height:1}.sl{font-size:9px;color:#4a5568;text-transform:uppercase;letter-spacing:.07em;margin-top:2px}
-.c1{color:#60a5fa}.c2{color:#f59e0b}.c3{color:#ef4444}
-.tb{background:#161b27;border-bottom:1px solid #1c2540;padding:8px 14px;display:flex;align-items:center;gap:5px;flex-wrap:wrap;position:sticky;top:0;z-index:100}
-.btn{padding:4px 12px;border-radius:4px;border:1px solid #1c2540;background:#1e2535;color:#64748b;cursor:pointer;font-size:11px;font-weight:600;font-family:Segoe UI,sans-serif;transition:all .15s}
+.c1{color:#60a5fa}.c2{color:#f59e0b}.c3{color:#ef4444}.cc{color:#ff4444;text-shadow:0 0 8px rgba(255,68,68,.5)}.c5{color:#10b981}.c6{color:#22c55e}.c7{color:#f87171}
+.tabs{background:#0d1220;border-bottom:1px solid #1c2540;display:flex;padding:0 16px}
+.tab{padding:10px 18px;cursor:pointer;font-size:12px;font-weight:600;color:#4a5568;border-bottom:2px solid transparent;transition:all .15s;white-space:nowrap}
+.tab:hover{color:#e2e8f0}.tab.on{color:#60a5fa;border-bottom-color:#3b82f6}
+.tab-panel{display:none}.tab-panel.on{display:block}
+.tb{background:#0d1220;border-bottom:1px solid #1c2540;padding:8px 14px;display:flex;align-items:center;gap:5px;flex-wrap:wrap;position:sticky;top:0;z-index:100}
+.btn{padding:4px 12px;border-radius:4px;border:1px solid #1c2540;background:#121929;color:#64748b;cursor:pointer;font-size:11px;font-weight:600;font-family:Segoe UI,sans-serif;transition:all .15s}
 .btn:hover,.btn.on{border-color:#3b82f6;color:#60a5fa;background:rgba(59,130,246,.12)}
 .bw{border-color:rgba(245,158,11,.4);color:#f59e0b}.bw:hover,.bw.on{background:rgba(245,158,11,.12);border-color:#f59e0b}
+.br{border-color:rgba(239,68,68,.4);color:#ef4444}.br:hover,.br.on{background:rgba(239,68,68,.1);border-color:#ef4444}
 .bg{border-color:rgba(16,185,129,.4);color:#10b981}.bg:hover{background:rgba(16,185,129,.1)}
 .sp{width:1px;height:18px;background:#1c2540;display:inline-block;vertical-align:middle}
-.srch{margin-left:auto;background:#1e2535;border:1px solid #1c2540;border-radius:4px;color:#e2e8f0;padding:5px 10px;font-size:11px;width:200px;outline:none;font-family:Consolas,monospace;transition:border-color .15s,width .2s}
+.srch{margin-left:auto;background:#121929;border:1px solid #1c2540;border-radius:4px;color:#e2e8f0;padding:5px 10px;font-size:11px;width:200px;outline:none;font-family:Consolas,monospace;transition:border-color .15s,width .2s}
 .srch:focus{border-color:#3b82f6;width:260px}
 table{width:100%;border-collapse:collapse}
-thead{background:#1e2535;position:sticky;top:48px;z-index:10}
+thead{background:#121929;position:sticky;top:48px;z-index:10}
 th{padding:8px 12px;text-align:left;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:#4a5568;border-bottom:1px solid #1c2540;white-space:nowrap;cursor:pointer}
-th:hover{color:#e2e8f0}
-td{padding:7px 12px;border-bottom:1px solid rgba(28,37,64,.5);vertical-align:middle}
-tr.u td{background:rgba(245,158,11,.025)}tr:hover td{background:rgba(255,255,255,.02)}
-.ftr{background:#161b27;border-top:1px solid #1c2540;padding:6px 14px;display:flex;justify-content:space-between;font-family:Consolas,monospace;font-size:10px;color:#4a5568;position:sticky;bottom:0}
+th:hover{color:#e2e8f0}td{padding:7px 12px;border-bottom:1px solid rgba(28,37,64,.5);vertical-align:middle}
+tr.u td{background:rgba(245,158,11,.02)}tr:hover td{background:rgba(255,255,255,.018)}
+tr.added td{background:rgba(34,197,94,.06)}tr.removed td{background:rgba(248,113,113,.06)}
+.badge{display:inline-block;padding:2px 6px;border-radius:3px;font-size:10px;font-weight:700;text-transform:uppercase;white-space:nowrap}
+.b-site{background:rgba(129,140,248,.1);color:#818cf8;border:1px solid rgba(129,140,248,.2)}
+.b-lib{background:rgba(34,211,238,.08);color:#22d3ee;border:1px solid rgba(34,211,238,.18)}
+.b-list{background:rgba(251,146,60,.08);color:#fb923c;border:1px solid rgba(251,146,60,.18)}
+.b-fold{background:rgba(52,211,153,.08);color:#34d399;border:1px solid rgba(52,211,153,.18)}
+.b-file{background:rgba(167,139,250,.08);color:#a78bfa;border:1px solid rgba(167,139,250,.18)}
+.b-uniq{background:rgba(245,158,11,.1);color:#f59e0b;border:1px solid rgba(245,158,11,.22)}
+.b-inh{background:rgba(74,85,104,.08);color:#64748b;border:1px solid rgba(74,85,104,.18)}
+.b-user{background:rgba(59,130,246,.08);color:#60a5fa;border:1px solid rgba(59,130,246,.18)}
+.b-sp{background:rgba(52,211,153,.08);color:#10b981;border:1px solid rgba(52,211,153,.18)}
+.b-sec{background:rgba(167,139,250,.08);color:#a78bfa;border:1px solid rgba(167,139,250,.18)}
+.b-add{background:rgba(34,197,94,.1);color:#22c55e;border:1px solid rgba(34,197,94,.25)}
+.b-del{background:rgba(248,113,113,.1);color:#f87171;border:1px solid rgba(248,113,113,.25)}
+.perm{display:inline-block;padding:2px 6px;border-radius:3px;font-size:10px;font-family:Consolas,monospace;white-space:nowrap}
+.p-full{color:#fca5a5;background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2)}
+.p-edit{color:#fcd34d;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2)}
+.p-contrib{color:#60a5fa;background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2)}
+.p-read{color:#6ee7b7;background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2)}
+.p-other{color:#64748b;background:rgba(74,85,104,.06);border:1px solid rgba(74,85,104,.18)}
+.risk-ok{color:#10b981;font-size:10px}.risk-crit{color:#ff4444;font-weight:700;font-size:10px}.risk-high{color:#ef4444;font-size:10px}.risk-med{color:#f59e0b;font-size:10px}
+.user-card{background:#0d1220;border:1px solid #1c2540;border-radius:6px;margin:10px 16px;padding:14px}
+.user-name{font-size:14px;font-weight:600;color:#e2e8f0;margin-bottom:2px}
+.user-login{font-family:Consolas,monospace;font-size:10px;color:#4a5568}
+.user-stats{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}
+.ust{font-size:10px;padding:2px 8px;border-radius:10px;border:1px solid #1c2540;background:#121929;color:#64748b}
+.user-objs{margin-top:10px;display:none}
+.user-card.open .user-objs{display:block}
+.utog{cursor:pointer;float:right;color:#3b82f6;font-size:11px;user-select:none}
+.urow{padding:5px 8px;border-bottom:1px solid rgba(28,37,64,.4);font-size:12px;display:flex;align-items:center;gap:8px}
+.urow:last-child{border-bottom:none}
+.obj-url{font-family:Consolas,monospace;font-size:10px;color:#4a5568;margin-top:2px}
+a{color:#60a5fa;text-decoration:none}a:hover{text-decoration:underline}
 .em{display:none;padding:60px;text-align:center;color:#4a5568;font-size:14px}
+.ftr{background:#0d1220;border-top:1px solid #1c2540;padding:6px 14px;display:flex;justify-content:space-between;font-family:Consolas,monospace;font-size:10px;color:#4a5568;position:sticky;bottom:0}
+.dl{padding:8px 16px;font-size:11px;color:#4a5568;background:#0d1220;border-bottom:1px solid #1c2540;display:flex;gap:16px;align-items:center}
 ::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-thumb{background:#1c2540;border-radius:3px}
 </style>
 '@
 
-    # 4. PreContent avec interpolation PS
-    $totalRows  = $data.Count
+    # 5. PreContent
     $pre  = "<div class=`"hdr`">"
     $pre += "<div><span class=`"logo`">SP</span><span class=`"brand`">SharePoint <b>Permissions</b></span>"
-    $pre += "<div class=`"sub`">$genDate &nbsp;|&nbsp; Mode: $Mode &nbsp;|&nbsp; Depth: $ScanDepth &nbsp;|&nbsp; ${scanDuration}s</div></div>"
+    $pre += "<div class=`"sub`">$genDate | Mode: $Mode | Depth: $ScanDepth | ${scanDuration}s$focusLabel</div></div>"
     $pre += "<div class=`"stats`">"
     $pre += "<div class=`"stat`"><div class=`"sn c1`">$siteCount</div><div class=`"sl`">Sites</div></div>"
     $pre += "<div class=`"stat`"><div class=`"sn`">$totalRows</div><div class=`"sl`">Lignes</div></div>"
     $pre += "<div class=`"stat`"><div class=`"sn c2`">$uniqueCount</div><div class=`"sl`">Uniques</div></div>"
-    $pre += "<div class=`"stat`"><div class=`"sn c3`">$errorCount</div><div class=`"sl`">Erreurs</div></div>"
+    $pre += "<div class=`"stat`"><div class=`"sn cc`">$critCount</div><div class=`"sl`">Critiques</div></div>"
+    $pre += "<div class=`"stat`"><div class=`"sn c3`">$highCount</div><div class=`"sl`">Eleves</div></div>"
+    if ($CompareWith) {
+        $pre += "<div class=`"stat`"><div class=`"sn c6`">+$addedCount</div><div class=`"sl`">Ajoutes</div></div>"
+        $pre += "<div class=`"stat`"><div class=`"sn c7`">-$removedCount</div><div class=`"sl`">Supprimes</div></div>"
+    }
     $pre += "</div></div>"
+    $pre += "<div class=`"tabs`">"
+    $pre += "<div class=`"tab on`" onclick=`"showTab('perms',this)`">Permissions</div>"
+    $pre += "<div class=`"tab`" onclick=`"showTab('users',this)`">Vue utilisateur</div>"
+    $pre += "<div class=`"tab`" onclick=`"showTab('risks',this)`">Risques ($riskTotal)</div>"
+    $pre += "<div class=`"tab`" onclick=`"showTab('diff',this)`"$compareTabDisplay>Comparaison (+$addedCount / -$removedCount)</div>"
+    $pre += "</div>"
+    $pre += "<div class=`"tab-panel on`" id=`"tab-perms`">"
     $pre += "<div class=`"tb`">"
     $pre += "<button class=`"btn on`" onclick=`"f('all',this)`">Tous</button>"
     $pre += "<button class=`"btn`" style=`"color:#818cf8;border-color:#818cf8`" onclick=`"f('Site',this)`">Sites</button>"
@@ -512,71 +680,214 @@ tr.u td{background:rgba(245,158,11,.025)}tr:hover td{background:rgba(255,255,255
     $pre += "<button class=`"btn`" style=`"color:#34d399;border-color:#34d399`" onclick=`"f('Folder',this)`">Dossiers</button>"
     $pre += "<button class=`"btn`" style=`"color:#a78bfa;border-color:#a78bfa`" onclick=`"f('File',this)`">Fichiers</button>"
     $pre += "<span class=`"sp`"></span>"
-    $pre += "<button class=`"btn bw`" id=`"bu`" onclick=`"uf()`">Uniques seulement</button>"
+    $pre += "<button class=`"btn bw`" id=`"bu`" onclick=`"toggleUniq()`">Uniques seulement</button>"
     $pre += "<span class=`"sp`"></span>"
-    $pre += "<button class=`"btn bg`" onclick=`"ex()`">Export CSV</button>"
+    $pre += "<button class=`"btn bg`" onclick=`"ex('main-table')`">Export CSV</button>"
     $pre += "<input class=`"srch`" id=`"s`" placeholder=`"Rechercher...`" oninput=`"ft()`">"
-    $pre += "</div><div class=`"em`" id=`"em`">Aucun resultat.</div>"
+    $pre += "</div>"
+    $pre += "<div class=`"em`" id=`"em`">Aucun resultat.</div>"
 
-    # 5. PostContent - single-quoted here-string = JS pur, zero interpolation PS
+    # 6. PostContent - single-quoted here-string
     $post = @'
+</div>
+<div class="tab-panel" id="tab-users">
+  <div class="tb">
+    <input class="srch" id="s-u" placeholder="Filtrer par utilisateur..." oninput="fu()" style="margin-left:0;width:280px">
+    <span class="sp"></span>
+    <button class="btn bg" onclick="ex('user-table')">Export CSV</button>
+  </div>
+  <div id="ucards"></div>
+  <table id="user-table" style="display:none">
+    <thead><tr><th>Principal</th><th>Login</th><th>Type</th><th>ObjectType</th><th>Objet</th><th>Niveau</th><th>Unique</th><th>Site</th></tr></thead>
+    <tbody id="utbody"></tbody>
+  </table>
+</div>
+<div class="tab-panel" id="tab-risks">
+  <div class="tb">
+    <button class="btn on" onclick="fr('all',this)">Tous</button>
+    <button class="btn br" onclick="fr('CRITIQUE',this)">Critiques</button>
+    <button class="btn br" onclick="fr('ELEVE',this)">Eleves</button>
+    <button class="btn bw" onclick="fr('MOYEN',this)">Moyens</button>
+    <span class="sp"></span>
+    <button class="btn bg" onclick="ex('risk-table')">Export CSV</button>
+    <input class="srch" id="s-r" placeholder="Rechercher..." oninput="ftr()">
+  </div>
+  <div class="em" id="em-r">Aucun risque detecte.</div>
+  <table id="risk-table"><thead><tr><th>Risque</th><th>Type</th><th>Objet</th><th>Principal</th><th>Type Principal</th><th>Niveau</th><th>Site</th></tr></thead><tbody id="rtbody"></tbody></table>
+</div>
+<div class="tab-panel" id="tab-diff">
+  <div class="dl">
+    <span style="color:#22c55e">+ Ajoute</span>
+    <span style="color:#f87171">- Supprime</span>
+    <span>Permissions ajoutees ou supprimees depuis le scan precedent</span>
+    <button class="btn bg" onclick="ex('diff-table')" style="margin-left:auto">Export CSV</button>
+  </div>
+  <div class="em" id="em-d">Aucune difference detectee.</div>
+  <table id="diff-table"><thead><tr><th>Changement</th><th>Type</th><th>Objet</th><th>Principal</th><th>Niveau</th><th>Risque</th><th>Site</th></tr></thead><tbody id="dtbody"></tbody></table>
+</div>
 <div class="ftr"><span>SP Permission Scanner v1.0</span><span id="rc"></span></div>
 <script>
-var tf="all",uo=false;
+var DA=[],tf="all",uo=false,rf="all";
+var DADD=__DIFF_ADDED__;
+var DREM=__DIFF_REMOVED__;
+var HC=__HAS_COMPARE__;
+
+function showTab(id,btn){
+  document.querySelectorAll(".tab-panel").forEach(function(p){p.classList.remove("on");});
+  document.querySelectorAll(".tab").forEach(function(b){b.classList.remove("on");});
+  document.getElementById("tab-"+id).classList.add("on");
+  btn.classList.add("on");
+}
 function init(){
-  var trs=document.querySelectorAll("table tbody tr");
+  var trs=document.querySelectorAll("#main-table tbody tr");
   trs.forEach(function(tr){
     var c=tr.querySelectorAll("td");
     if(!c.length)return;
-    var ot=c[2]?c[2].textContent.trim():"";
-    tr.dataset.t=ot;
-    var hu=c[5]?c[5].textContent.trim():"";
-    if(hu==="True")tr.className="u";
+    var d={ot:c[2]?c[2].textContent.trim():"",hu:c[5]?c[5].textContent.trim():"",risk:c[11]?c[11].textContent.trim():"",tr:tr};
+    DA.push(d);
+    tr.dataset.t=d.ot;
+    if(d.hu==="True")tr.className="u";
   });
-  cnt();
+  cnt();buildU();buildR();if(HC)buildD();
 }
 function ft(){
   var q=(document.getElementById("s").value||"").toLowerCase();
-  var trs=document.querySelectorAll("table tbody tr");
   var v=0;
-  trs.forEach(function(tr){
-    var ok=(tf==="all"||tr.dataset.t===tf)&&(!uo||tr.className==="u")&&(!q||tr.textContent.toLowerCase().indexOf(q)!==-1);
-    tr.style.display=ok?"":"none";
-    if(ok)v++;
+  DA.forEach(function(d){
+    var ok=(tf==="all"||d.tr.dataset.t===tf)&&(!uo||d.tr.className==="u")&&(!q||d.tr.textContent.toLowerCase().indexOf(q)!==-1);
+    d.tr.style.display=ok?"":"none";if(ok)v++;
   });
   document.getElementById("rc").textContent=v+" lignes";
   document.getElementById("em").style.display=v===0?"block":"none";
 }
-function cnt(){document.getElementById("rc").textContent=document.querySelectorAll("table tbody tr").length+" lignes";}
-function f(t,btn){tf=t;document.querySelectorAll(".tb .btn").forEach(function(b){b.classList.remove("on");});btn.classList.add("on");ft();}
-function uf(){uo=!uo;document.getElementById("bu").classList.toggle("on",uo);ft();}
-function ex(){
-  var rows=[Array.from(document.querySelectorAll("table thead th")).map(function(h){return h.textContent.trim();})];
-  document.querySelectorAll("table tbody tr").forEach(function(tr){
+function cnt(){document.getElementById("rc").textContent=DA.length+" lignes";}
+function f(t,btn){tf=t;document.querySelectorAll(".tb .btn:not(.bw):not(.br):not(.bg)").forEach(function(b){b.classList.remove("on");});btn.classList.add("on");ft();}
+function toggleUniq(){uo=!uo;document.getElementById("bu").classList.toggle("on",uo);ft();}
+function buildR(){
+  var trs=document.querySelectorAll("#main-table tbody tr");
+  var h="";var n=0;
+  trs.forEach(function(tr){
+    var c=tr.querySelectorAll("td");if(!c.length)return;
+    var risk=c[11]?c[11].textContent.trim():"";
+    if(risk==="OK"||!risk)return;
+    n++;
+    var rc=risk.startsWith("CRITIQUE")?"risk-crit":risk.startsWith("ELEVE")?"risk-high":"risk-med";
+    h+="<tr data-risk=""+risk+"">";
+    h+="<td><span class=""+rc+"">"+esc(risk)+"</span></td>";
+    h+="<td>"+c[2].innerHTML+"</td><td>"+c[3].innerHTML+"</td>";
+    h+="<td>"+esc(c[7]?c[7].textContent.trim():"")+"</td>";
+    h+="<td>"+c[9].innerHTML+"</td><td>"+c[10].innerHTML+"</td>";
+    h+="<td style="color:#4a5568;font-size:11px">"+esc(c[0]?c[0].textContent.trim():"")+"</td></tr>";
+  });
+  document.getElementById("rtbody").innerHTML=h;
+  if(!n){document.getElementById("em-r").style.display="block";document.getElementById("risk-table").style.display="none";}
+}
+function fr(l,btn){rf=l;document.querySelectorAll("#tab-risks .tb .btn:not(.bg)").forEach(function(b){b.classList.remove("on");});btn.classList.add("on");ftr();}
+function ftr(){var q=(document.getElementById("s-r").value||"").toLowerCase();document.querySelectorAll("#rtbody tr").forEach(function(tr){var ok=(rf==="all"||tr.dataset.risk.startsWith(rf))&&(!q||tr.textContent.toLowerCase().indexOf(q)!==-1);tr.style.display=ok?"":"none";});}
+function buildU(){
+  var trs=document.querySelectorAll("#main-table tbody tr");
+  var users={};
+  trs.forEach(function(tr){
+    var c=tr.querySelectorAll("td");if(!c.length)return;
+    var prin=c[7]?c[7].textContent.trim():"";
+    var login=c[8]?c[8].textContent.trim():"";
+    var pt=c[9]?c[9].textContent.trim():"";
+    if(!prin||prin==="(inherited)"||prin==="(no assignments)")return;
+    var key=login||prin;
+    if(!users[key])users[key]={name:prin,login:login,type:pt,items:[]};
+    users[key].items.push({ot:c[2]?c[2].textContent.trim():"",name:c[3]?c[3].textContent.trim():"",url:c[4]?c[4].textContent.trim():"",lvl:c[10]?c[10].textContent.trim():"",hu:c[5]?c[5].textContent.trim():"",site:c[0]?c[0].textContent.trim():"",risk:c[11]?c[11].textContent.trim():""});
+  });
+  var ks=Object.keys(users).sort();
+  var ch="";
+  ks.forEach(function(k,i){
+    var u=users[k];
+    var risks=u.items.filter(function(x){return x.risk!=="OK"&&x.risk!=="";}).length;
+    var uniq=u.items.filter(function(x){return x.hu==="True";}).length;
+    var tb=u.type==="User"?"b-user":u.type==="SP Group"?"b-sp":"b-sec";
+    ch+="<div class="user-card" id="uc-"+i+"">";
+    ch+="<span class="utog" onclick="tog("+i+")">▶ "+u.items.length+" acces</span>";
+    ch+="<div class="user-name"><span class="badge "+tb+"" style="margin-right:6px">"+esc(u.type)+"</span>"+esc(u.name)+"</div>";
+    ch+="<div class="user-login">"+esc(u.login)+"</div>";
+    ch+="<div class="user-stats"><span class="ust">"+u.items.length+" objets</span><span class="ust">"+uniq+" uniques</span>";
+    if(risks)ch+="<span class="ust" style="color:#ef4444;border-color:rgba(239,68,68,.3)">"+risks+" risque(s)</span>";
+    ch+="</div><div class="user-objs" id="uo-"+i+"">";
+    u.items.forEach(function(it){
+      var otShort=it.ot.toLowerCase().replace("library","lib");
+      ch+="<div class="urow"><span class="badge b-"+otShort+"" style="flex-shrink:0">"+esc(it.ot)+"</span>";
+      ch+="<a href=""+esc(it.url)+"" target="_blank" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">"+esc(it.name)+"</a>";
+      ch+="<span class="perm "+lvlCls(it.lvl)+"" style="flex-shrink:0">"+esc(it.lvl)+"</span>";
+      if(it.risk!=="OK"&&it.risk)ch+="<span style="color:#ef4444;font-size:10px;flex-shrink:0" title=""+esc(it.risk)+"">&#9888;</span>";
+      ch+="</div>";
+    });
+    ch+="</div></div>";
+  });
+  document.getElementById("ucards").innerHTML=ch||"<div class='em' style='display:block'>Aucun utilisateur.</div>";
+  var th="";
+  ks.forEach(function(k){var u=users[k];u.items.forEach(function(it){th+="<tr><td>"+esc(u.name)+"</td><td>"+esc(u.login)+"</td><td>"+esc(u.type)+"</td><td>"+esc(it.ot)+"</td><td>"+esc(it.name)+"</td><td>"+esc(it.lvl)+"</td><td>"+esc(it.hu)+"</td><td>"+esc(it.site)+"</td></tr>";});});
+  document.getElementById("utbody").innerHTML=th;
+}
+function tog(i){var c=document.getElementById("uc-"+i);var t=c.querySelector(".utog");var o=document.getElementById("uo-"+i);var n=c.classList.toggle("open");t.innerHTML=(n?"▼":"▶")+" "+c.querySelectorAll(".urow").length+" acces";}
+function fu(){var q=(document.getElementById("s-u").value||"").toLowerCase();document.querySelectorAll(".user-card").forEach(function(c){c.style.display=(!q||c.textContent.toLowerCase().indexOf(q)!==-1)?"":"none";});}
+function buildD(){
+  if(!HC)return;
+  var all=[];
+  DADD.forEach(function(r){r._t="AJOUTE";all.push(r);});
+  DREM.forEach(function(r){r._t="SUPPRIME";all.push(r);});
+  if(!all.length){document.getElementById("em-d").style.display="block";document.getElementById("diff-table").style.display="none";return;}
+  var h="";
+  all.forEach(function(r){
+    var cls=r._t==="AJOUTE"?"added":"removed";
+    var b=r._t==="AJOUTE"?"<span class='badge b-add'>+ Ajoute</span>":"<span class='badge b-del'>- Supprime</span>";
+    var ot=(r.ObjectType||"").toLowerCase().replace("library","lib");
+    h+="<tr class=""+cls+""><td>"+b+"</td>";
+    h+="<td><span class='badge b-"+ot+"'>"+esc(r.ObjectType||"")+"</span></td>";
+    h+="<td><a href='"+esc(r.ObjectUrl||"")+"' target='_blank'>"+esc(r.ObjectName||"")+"</a></td>";
+    h+="<td>"+esc(r.Principal||"")+"</td>";
+    h+="<td><span class='perm "+lvlCls(r.PermissionLevel||"")+"'>"+esc(r.PermissionLevel||"")+"</span></td>";
+    var rk=r.Risk||"OK";var rc=rk.startsWith("CRITIQUE")?"risk-crit":rk.startsWith("ELEVE")?"risk-high":rk.startsWith("MOYEN")?"risk-med":"risk-ok";
+    h+="<td><span class='"+rc+"'>"+esc(rk)+"</span></td>";
+    h+="<td style='color:#4a5568;font-size:11px'>"+esc(r.SiteName||"")+"</td></tr>";
+  });
+  document.getElementById("dtbody").innerHTML=h;
+}
+function lvlCls(l){var s=(l||"").toLowerCase();if(s.indexOf("full control")!==-1)return"p-full";if(s.indexOf("edit")!==-1||s.indexOf("design")!==-1)return"p-edit";if(s.indexOf("contribut")!==-1)return"p-contrib";if(s.indexOf("read")!==-1||s.indexOf("view")!==-1)return"p-read";return"p-other";}
+function esc(s){if(!s)return"";return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+function ex(id){
+  var tbl=document.getElementById(id);if(!tbl)return;
+  var hs=Array.from(tbl.querySelectorAll("thead th")).map(function(h){return"""+h.textContent.trim()+""";});
+  var rows=[hs.join(",")];
+  tbl.querySelectorAll("tbody tr").forEach(function(tr){
     if(tr.style.display==="none")return;
-    rows.push(Array.from(tr.querySelectorAll("td")).map(function(c){return '"'+c.textContent.trim().replace(/"/g,'""')+'"';}));
+    rows.push(Array.from(tr.querySelectorAll("td")).map(function(c){return"""+c.textContent.trim().replace(/"/g,"""")+""";}).join(","));
   });
   var a=document.createElement("a");
-  a.href=URL.createObjectURL(new Blob(["\uFEFF"+rows.map(function(r){return r.join(",");}).join("\n")],{type:"text/csv;charset=utf-8;"}));
-  a.download="sp-export.csv";a.click();
+  a.href=URL.createObjectURL(new Blob(["﻿"+rows.join("
+")],{type:"text/csv;charset=utf-8;"}));
+  a.download="sp-"+id+".csv";a.click();
 }
 window.addEventListener("DOMContentLoaded",init);
 </script>
 '@
 
-    # 6. Generer via Import-Csv -> ConvertTo-Html -> Out-File (methode eprouvee)
+    $post = $post.Replace("__DIFF_ADDED__",   $addedJson)
+    $post = $post.Replace("__DIFF_REMOVED__", $removedJson)
+    $post = $post.Replace("__HAS_COMPARE__",  $hasCompare)
+
+    # 7. Generer HTML
     $data | ConvertTo-Html -Head $css -PreContent $pre -PostContent $post -Title "SP Permissions - $genDate" |
         Out-File -FilePath $OutputPath -Encoding UTF8 -Force
+
+    # Ajouter id="main-table" sur la table generee
+    $html = Get-Content $OutputPath -Raw -Encoding UTF8
+    $html = $html -replace "<table>", "<table id=`"main-table`">"
+    Set-Content $OutputPath -Value $html -Encoding UTF8
 
     Write-Log "HTML : $OutputPath" -Level OK
     Write-Log "CSV  : $csvPath"    -Level OK
 }
 
-
-
 #endregion
 
-#region ──────────────────────── ENTRY POINT ────────────────────────
 
 try {
     # Validate parameters
@@ -603,9 +914,29 @@ try {
     }
 
     # Check PnP module
+    # Verifier PnP.PowerShell
     if (-not (Get-Module -ListAvailable -Name "PnP.PowerShell")) {
-        Write-Log "PnP.PowerShell module not found. Install it with: Install-Module PnP.PowerShell" -Level ERROR
+        Write-Log "PnP.PowerShell non installe. Lancez : Install-Module PnP.PowerShell -Scope CurrentUser" -Level ERROR
         exit 1
+    }
+    # Importer PnP proprement en evitant les conflits d assemblies Microsoft.Graph
+    # Si Microsoft.Graph SDK est deja charge dans la session, PnP peut entrer en conflit.
+    # Solution : ne pas importer explicitement (PnP.PowerShell s auto-importe via ses cmdlets)
+    # et ignorer les erreurs d assembly non critiques.
+    if (-not (Get-Module -Name "PnP.PowerShell")) {
+        try {
+            Import-Module PnP.PowerShell -ErrorAction Stop -WarningAction SilentlyContinue
+            Write-Log "PnP.PowerShell charge." -Level OK
+        } catch {
+            if ($_.Exception.Message -like "*Assembly*already loaded*" -or
+                $_.Exception.Message -like "*Could not load file or assembly*") {
+                Write-Log "Avertissement assembly Graph (non bloquant) - le script continue." -Level WARN
+            } else {
+                Write-Log "Erreur chargement PnP.PowerShell : $_" -Level ERROR
+                Write-Log "Conseil : Ouvrez une nouvelle session PowerShell et relancez le script." -Level WARN
+                exit 1
+            }
+        }
     }
 
     # Choix interactif du ScanDepth si pas specifie (valeur par defaut)
