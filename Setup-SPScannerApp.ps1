@@ -125,19 +125,22 @@ function Test-Prerequisites {
         }
     }
 
-    # PnP.PowerShell
+
+    # PnP.PowerShell - verifier disponibilite uniquement, NE PAS importer
+    # (evite le conflit avec Microsoft.Graph.Authentication)
     $pnpMod = Get-Module -ListAvailable -Name "PnP.PowerShell" | Select-Object -First 1
     if (-not $pnpMod) {
-        Write-Warn "Module PnP.PowerShell non trouvé."
+        Write-Warn "Module PnP.PowerShell non trouve (necessaire pour SPPermissionScanner.ps1)."
         if (Confirm-Step "Installer PnP.PowerShell maintenant ?") {
             Install-Module PnP.PowerShell -Scope CurrentUser -Force
-            Write-Ok "PnP.PowerShell installé."
+            Write-Ok "PnP.PowerShell installe."
         } else {
-            Write-Warn "PnP.PowerShell nécessaire pour SPPermissionScanner.ps1"
+            Write-Warn "PnP.PowerShell sera necessaire pour lancer le scan."
         }
     } else {
-        Write-Ok "PnP.PowerShell $($pnpMod.Version)"
+        Write-Ok "PnP.PowerShell $($pnpMod.Version) disponible (non importe - evite conflit Graph)."
     }
+
 
     if (-not $ok) { throw "Prérequis manquants. Corrigez les erreurs ci-dessus et relancez." }
 
@@ -168,10 +171,10 @@ function Get-SetupInfo {
     Write-Host ""
     Write-Info "Choisissez le scope de scan pour adapter les permissions :"
     Write-Host "  [1] Un seul site SharePoint" -ForegroundColor White
-    Write-Host "  [2] Plusieurs sites spécifiques" -ForegroundColor White
-    Write-Host "  [3] Tous les sites du tenant (nécessite admin)" -ForegroundColor White
+    Write-Host "  [2] Plusieurs sites specifiques" -ForegroundColor White
+    Write-Host "  [3] Tous les sites du tenant (necessite admin)" -ForegroundColor White
     Write-Host ""
-    Write-Host "  ➤  Votre choix [1/2/3] : " -NoNewline -ForegroundColor White
+    Write-Host "  >> Votre choix [1/2/3] : " -NoNewline -ForegroundColor White
     $scope = Read-Host
     [string]$scopeVal = switch ($scope) {
         "1" { "SingleSite"; break }
@@ -181,9 +184,39 @@ function Get-SetupInfo {
     }
     $info.Scope = $scopeVal
 
-    $info.CertPath     = Read-Prompt "Dossier pour le certificat" "$env:USERPROFILE\SPScannerCert"
-    $info.CertPassword = Read-Prompt "Mot de passe du certificat (laisser vide = sans MDP)" ""
-    $info.ConfigOutput = Read-Prompt "Fichier de config à générer" ".\SPScanner.config.ps1"
+    # Multi-tenant ?
+    Write-Host ""
+    Write-Info "Type d app :"
+    Write-Host "  [1] Single-tenant  : app utilisable dans votre tenant uniquement" -ForegroundColor White
+    Write-Host "  [2] Multi-tenant   : app utilisable dans plusieurs tenants (MSP/consultants)" -ForegroundColor White
+    Write-Host ""
+    Write-Host "  >> Votre choix [1/2] (defaut: 1) : " -NoNewline -ForegroundColor White
+    [string]$mtChoice = Read-Host
+    if ($mtChoice -eq "2") {
+        $info.MultiTenant = $true
+        Write-Warn "Multi-tenant : chaque tenant cible devra accorder son propre consentement admin."
+    } else {
+        $info.MultiTenant = $false
+    }
+
+    # Methode d authentification
+    Write-Host ""
+    Write-Info "Methode d authentification :"
+    Write-Host "  [1] Certificat  : plus securise, recommande pour la prod" -ForegroundColor White
+    Write-Host "  [2] Secret      : plus simple, aucun fichier .pfx a gerer" -ForegroundColor White
+    Write-Host ""
+    Write-Host "  >> Votre choix [1/2] (defaut: 1) : " -NoNewline -ForegroundColor White
+    [string]$authChoice = Read-Host
+    if ($authChoice -eq "2") {
+        $info.AuthMethod   = "Secret"
+        $info.CertPath     = ""
+        $info.CertPassword = ""
+    } else {
+        $info.AuthMethod   = "Certificate"
+        $info.CertPath     = Read-Prompt "Dossier pour le certificat" "$env:USERPROFILE\SPScannerCert"
+        $info.CertPassword = Read-Prompt "Mot de passe du certificat (laisser vide = sans MDP)" ""
+    }
+    $info.ConfigOutput = Read-Prompt "Fichier de config a generer" ".\SPScanner.config.ps1"
 
     return [hashtable]$info
 }
@@ -260,29 +293,45 @@ function New-ScannerCertificate {
 #region ── GRAPH CONNECTION ──
 
 function Connect-ToGraph {
-    Write-Step -Num 4 -Total 7 -Title "Connexion à Microsoft Graph"
+    Write-Step -Num 4 -Total 7 -Title "Connexion a Microsoft Graph"
 
-    Write-Info "Connexion avec votre compte admin pour créer l'App Registration."
-    Write-Warn "Votre compte doit avoir le rôle : Application Administrator (ou Global Admin)"
+    Write-Info "Connexion avec votre compte admin pour creer l App Registration."
+    Write-Warn "Votre compte doit avoir le role : Application Administrator (ou Global Admin)"
     Write-Host ""
+
+    # On a uniquement besoin de Connect-MgGraph et Invoke-MgGraphRequest
+    # Ces deux cmdlets sont dans Microsoft.Graph.Authentication - deja charge par PnP.PowerShell.
+    # On n importe aucun autre module Graph pour eviter les conflits d assembly.
+    Write-Info "Verification de Microsoft.Graph.Authentication..."
+    if (-not (Get-Command "Connect-MgGraph" -ErrorAction SilentlyContinue)) {
+        Write-Info "Connect-MgGraph absent - import de Microsoft.Graph.Authentication..."
+        try {
+            Import-Module Microsoft.Graph.Authentication -ErrorAction Stop -WarningAction SilentlyContinue
+            Write-Ok "Microsoft.Graph.Authentication charge."
+        } catch {
+            throw "Impossible de charger Microsoft.Graph.Authentication : $_. Installez-le avec : Install-Module Microsoft.Graph -Scope CurrentUser"
+        }
+    } else {
+        Write-Ok "Connect-MgGraph deja disponible - aucun import necessaire."
+    }
 
     $scopes = @(
         "Application.ReadWrite.All",
         "Directory.ReadWrite.All",
         "AppRoleAssignment.ReadWrite.All",
-        "Sites.FullControl.All"   # Necessaire pour accorder Sites.Selected par site
+        "Sites.FullControl.All"
     )
 
-    Write-Info "Scopes demandés : $($scopes -join ', ')"
+    Write-Info "Scopes : $($scopes -join ', ')"
     Write-Host ""
 
     if (-not (Confirm-Step "Lancer la connexion interactive ?")) {
-        throw "Connexion annulée par l'utilisateur."
+        throw "Connexion annulee par l utilisateur."
     }
 
     Connect-MgGraph -Scopes $scopes -NoWelcome
     $ctx = Get-MgContext
-    Write-Ok "Connecté en tant que : $($ctx.Account)"
+    Write-Ok "Connecte en tant que : $($ctx.Account)"
     Write-Ok "Tenant : $($ctx.TenantId)"
 
     return $ctx.TenantId
@@ -304,15 +353,26 @@ function New-AppRegistration {
     $spAppId    = "00000003-0000-0ff1-ce00-000000000000"  # SharePoint Online
     $graphAppId = "00000003-0000-0000-c000-000000000000"  # Microsoft Graph
 
-    $spServicePrincipal    = Get-MgServicePrincipal -Filter "appId eq '$spAppId'"    -Property "id,appId,appRoles"
-    $graphServicePrincipal = Get-MgServicePrincipal -Filter "appId eq '$graphAppId'" -Property "id,appId,appRoles"
+    $spSPResp = Invoke-MgGraphRequest -Method GET `
+        -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '$spAppId'&`$select=id,appId,appRoles" `
+        -OutputType PSObject
+    $spServicePrincipal = $spSPResp.value[0]
+
+    $graphSPResp = Invoke-MgGraphRequest -Method GET `
+        -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '$graphAppId'&`$select=id,appId,appRoles" `
+        -OutputType PSObject
+    $graphServicePrincipal = $graphSPResp.value[0]
 
     # Fonction helper pour trouver un AppRole par son nom
     function Get-AppRoleId {
         param([object]$ServicePrincipal, [string]$RoleName)
-        $role = $ServicePrincipal.AppRoles | Where-Object { $_.Value -eq $RoleName -and $_.AllowedMemberTypes -contains "Application" } | Select-Object -First 1
-        if (-not $role) { throw "Role '$RoleName' introuvable sur $($ServicePrincipal.AppId)" }
-        return $role.Id
+        # REST renvoie les proprietes en camelCase (id, value, allowedMemberTypes)
+        $role = $ServicePrincipal.appRoles | Where-Object {
+            ($_.value -eq $RoleName -or $_.Value -eq $RoleName) -and
+            ($_.allowedMemberTypes -contains "Application" -or $_.AllowedMemberTypes -contains "Application")
+        } | Select-Object -First 1
+        if (-not $role) { throw "Role '$RoleName' introuvable sur $($ServicePrincipal.appId)" }
+        if ($role.id) { return [string]$role.id } else { return [string]$role.Id }
     }
 
     # Construire la liste de permissions selon le scope
@@ -353,61 +413,110 @@ function New-AppRegistration {
         Write-Warn "Sites.Selected ne donne aucun acces par defaut - vous devrez accorder l acces par site apres le setup (etape 6)"
     }
 
-    # ── Lire le certificat (.cer) pour l'uploader ──
-    Write-Info "Lecture du certificat public..."
-    $certBytes  = [System.IO.File]::ReadAllBytes($Info.CerPath)
-    $certBase64 = [System.Convert]::ToBase64String($certBytes)
-    $cert       = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($Info.CerPath)
+    # ── Credential : Certificat ou Secret ──
+    $keyCredentials     = @()
+    $passwordCredentials = @()
 
-    $keyCredential = @{
-        type            = "AsymmetricX509Cert"
-        usage           = "Verify"
-        key             = $certBytes
-        displayName     = "SPScanner-Cert"
-        startDateTime   = $cert.NotBefore.ToString("o")
-        endDateTime     = $cert.NotAfter.ToString("o")
+    if ($Info.AuthMethod -eq "Certificate") {
+        Write-Info "Lecture du certificat public..."
+        $certBytes = [System.IO.File]::ReadAllBytes($Info.CerPath)
+        $cert      = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($Info.CerPath)
+        $keyCredentials = @(@{
+            type          = "AsymmetricX509Cert"
+            usage         = "Verify"
+            key           = [System.Convert]::ToBase64String($certBytes)
+            displayName   = "SPScanner-Cert"
+            startDateTime = $cert.NotBefore.ToString("o")
+            endDateTime   = $cert.NotAfter.ToString("o")
+        })
+        Write-Ok "Certificat charge : $($cert.Subject)"
+    } else {
+        Write-Info "Generation du client secret (valide 2 ans)..."
+        $secretExpiry = (Get-Date).AddYears(2).ToString("o")
+        $passwordCredentials = @(@{
+            displayName = "SPScanner-Secret"
+            endDateTime = $secretExpiry
+        })
     }
 
-    # ── Vérifier si l'app existe déjà ──
-    Write-Info "Vérification si l'app '$($Info.AppName)' existe déjà..."
-    $existingApp = Get-MgApplication -Filter "displayName eq '$($Info.AppName)'" -ErrorAction SilentlyContinue
+    # ── Verifier si l app existe deja (REST - evite besoin de Microsoft.Graph.Applications) ──
+    Write-Info "Verification si l app '$($Info.AppName)' existe deja..."
+    $filterQuery = [System.Uri]::EscapeDataString("displayName eq '$($Info.AppName)'")
+    $existingApps = Invoke-MgGraphRequest -Method GET `
+        -Uri "https://graph.microsoft.com/v1.0/applications?`$filter=$filterQuery" `
+        -OutputType PSObject
 
-    if ($existingApp) {
-        Write-Warn "Une app '$($Info.AppName)' existe déjà (ID: $($existingApp.AppId))."
-        if (Confirm-Step "Supprimer et recréer ?") {
-            Remove-MgApplication -ApplicationId $existingApp.Id
-            Write-Ok "App supprimée."
+    if ($existingApps.value -and $existingApps.value.Count -gt 0) {
+        $existingApp = $existingApps.value[0]
+        Write-Warn "Une app '$($Info.AppName)' existe deja (ID: $($existingApp.appId))."
+        if (Confirm-Step "Supprimer et recreer ?") {
+            Invoke-MgGraphRequest -Method DELETE `
+                -Uri "https://graph.microsoft.com/v1.0/applications/$($existingApp.id)"
+            Write-Ok "App supprimee."
         } else {
-            Write-Info "Utilisation de l'app existante."
-            $Info.AppId       = $existingApp.AppId
-            $Info.AppObjectId = $existingApp.Id
+            Write-Info "Utilisation de l app existante."
+            $Info.AppId       = $existingApp.appId
+            $Info.AppObjectId = $existingApp.id
             return [hashtable]$Info
         }
     }
 
-    # ── Créer l'app ──
-    Write-Info "Création de l'App Registration '$($Info.AppName)'..."
+    # Definir le type d app (single ou multi-tenant)
+    [string]$signInAudience = if ($Info.MultiTenant) { "AzureADMultipleOrgs" } else { "AzureADMyOrg" }
+    [string]$appType        = if ($Info.MultiTenant) { "Multi-tenant" } else { "Single-tenant" }
+    Write-Info "Type : $appType ($signInAudience)"
 
-    $appParams = @{
-        DisplayName            = $Info.AppName
-        SignInAudience         = "AzureADMyOrg"
-        RequiredResourceAccess = $requiredResourceAccess
-        KeyCredentials         = @($keyCredential)
-        Notes                  = "Créé par Setup-SPScannerApp.ps1 le $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+    # ── Creer l app via REST ──
+    Write-Info "Creation de l App Registration '$($Info.AppName)'..."
+    $appBody = @{
+        displayName            = $Info.AppName
+        signInAudience         = $signInAudience
+        requiredResourceAccess = $requiredResourceAccess
+        notes                  = "Cree par Setup-SPScannerApp.ps1 le $(Get-Date -Format 'yyyy-MM-dd HH:mm') - $appType"
+    }
+    if ($keyCredentials.Count      -gt 0) { $appBody.keyCredentials      = $keyCredentials      }
+    if ($passwordCredentials.Count -gt 0) { $appBody.passwordCredentials = $passwordCredentials }
+
+    $app = Invoke-MgGraphRequest -Method POST `
+        -Uri "https://graph.microsoft.com/v1.0/applications" `
+        -Body ($appBody | ConvertTo-Json -Depth 10) `
+        -ContentType "application/json" `
+        -OutputType PSObject
+    Write-Ok "App creee - Client ID : $($app.appId)"
+
+    # Mode Secret : ajouter le secret
+    if ($Info.AuthMethod -eq "Secret") {
+        $secretBody = @{ passwordCredential = @{
+            displayName = "SPScanner-Secret"
+            endDateTime = (Get-Date).AddYears(2).ToString("o")
+        }}
+        $secretResult = Invoke-MgGraphRequest -Method POST `
+            -Uri "https://graph.microsoft.com/v1.0/applications/$($app.id)/addPassword" `
+            -Body ($secretBody | ConvertTo-Json) `
+            -ContentType "application/json" `
+            -OutputType PSObject
+        $Info.ClientSecret = $secretResult.secretText
+        Write-Ok "Client Secret genere !"
+        Write-Host ""
+        Write-Host "  *** SECRET : $($secretResult.secretText) ***" -ForegroundColor Black -BackgroundColor Yellow
+        Write-Host ""
+        Write-Warn "Ce secret ne sera JAMAIS affiche a nouveau. Copiez-le maintenant !"
+        $null = Read-Host "  Appuyez sur Entree une fois le secret sauvegarde"
     }
 
-    $app = New-MgApplication @appParams
-    Write-Ok "App créée — Client ID : $($app.AppId)"
+    # ── Creer le Service Principal ──
+    Write-Info "Creation du Service Principal..."
+    $sp = Invoke-MgGraphRequest -Method POST `
+        -Uri "https://graph.microsoft.com/v1.0/servicePrincipals" `
+        -Body (@{ appId = $app.appId } | ConvertTo-Json) `
+        -ContentType "application/json" `
+        -OutputType PSObject
+    Write-Ok "Service Principal cree - Object ID : $($sp.id)"
 
-    # ── Créer le Service Principal ──
-    Write-Info "Création du Service Principal..."
-    $sp = New-MgServicePrincipal -AppId $app.AppId
-    Write-Ok "Service Principal créé — Object ID : $($sp.Id)"
-
-    $Info.AppId          = $app.AppId
-    $Info.AppObjectId    = $app.Id
-    $Info.SpObjectId     = $sp.Id
-    $Info.TenantId       = $TenantId
+    $Info.AppId       = $app.appId
+    $Info.AppObjectId = $app.id
+    $Info.SpObjectId  = $sp.id
+    $Info.TenantId    = $TenantId
 
     Write-Host ""
     $null = Read-Host "  Appuyez sur Entree pour continuer"
@@ -429,71 +538,76 @@ function Grant-AdminConsent {
     Write-Info "Tentative de grant automatique via Microsoft Graph..."
 
     try {
-        # Recuperer l app via son appId (contient RequiredResourceAccess)
-        $appObj = Get-MgApplication -Filter "appId eq '$($Info.AppId)'" `
-                    -Property "id,appId,requiredResourceAccess"
+        # Recuperer l app et accorder les permissions via REST (Invoke-MgGraphRequest uniquement)
+        Write-Info "Recuperation de l app et des service principals..."
 
-        # Recuperer le Service Principal de l app
-        $appSP = Get-MgServicePrincipal -Filter "appId eq '$($Info.AppId)'" `
-                    -Property "id,appId"
+        # App
+        $filterQ = [System.Uri]::EscapeDataString("appId eq '$($Info.AppId)'")
+        $appResp = Invoke-MgGraphRequest -Method GET `
+            -Uri "https://graph.microsoft.com/v1.0/applications?`$filter=$filterQ" `
+            -OutputType PSObject
+        $appObj = $appResp.value[0]
 
-        # Recuperer les SP des API cibles
-        $spSP    = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0ff1-ce00-000000000000'" `
-                    -Property "id,appId,appRoles"
-        $graphSP = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'" `
-                    -Property "id,appId,appRoles"
+        # SP de notre app
+        $spResp = Invoke-MgGraphRequest -Method GET `
+            -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=$filterQ" `
+            -OutputType PSObject
+        $appSP = $spResp.value[0]
+
+        # SP SharePoint
+        $spSharePoint = Invoke-MgGraphRequest -Method GET `
+            -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '00000003-0000-0ff1-ce00-000000000000'&`$select=id,appId,appRoles" `
+            -OutputType PSObject
+        $spSP = $spSharePoint.value[0]
+
+        # SP Graph
+        $spGraphResp = Invoke-MgGraphRequest -Method GET `
+            -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '00000003-0000-0000-c000-000000000000'&`$select=id,appId,appRoles" `
+            -OutputType PSObject
+        $graphSP = $spGraphResp.value[0]
+
+        # Recuperer les assignments existants
+        $existingAssignments = Invoke-MgGraphRequest -Method GET `
+            -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$($appSP.id)/appRoleAssignments" `
+            -OutputType PSObject
+        $existingIds = @($existingAssignments.value | ForEach-Object { "$($_.resourceId)|$($_.appRoleId)" })
 
         $grantedRoles  = [System.Collections.Generic.List[string]]::new()
         $skippedRoles  = [System.Collections.Generic.List[string]]::new()
 
-        foreach ($resource in $appObj.RequiredResourceAccess) {
-            [string]$rid = $resource.ResourceAppId
-
+        foreach ($resource in $appObj.requiredResourceAccess) {
+            $rid = $resource.resourceAppId
             $targetSP  = $null
-            [string]$apiName = $rid
+            $apiName   = $rid
             if     ($rid -eq "00000003-0000-0ff1-ce00-000000000000") { $targetSP = $spSP;    $apiName = "SharePoint" }
             elseif ($rid -eq "00000003-0000-0000-c000-000000000000") { $targetSP = $graphSP; $apiName = "Graph"      }
+            if (-not $targetSP) { continue }
 
-            if (-not $targetSP) {
-                # Tentative de resolution generique
-                Write-Warn "  Ressource inconnue $rid - tentative de resolution..."
-                try {
-                    $targetSP = Get-MgServicePrincipal -Filter "appId eq '$rid'" -Property "id,appId,appRoles" -ErrorAction Stop
-                    $apiName = $targetSP.DisplayName
-                } catch {
-                    Write-Warn "  Ressource $rid introuvable - ignoree"
-                    continue
-                }
-            }
+            foreach ($acc in $resource.resourceAccess) {
+                if ($acc.type -ne "Role") { continue }
+                $roleId   = $acc.id
+                $roleDef  = $targetSP.appRoles | Where-Object { $_.id -eq $roleId } | Select-Object -First 1
+                $roleName = if ($roleDef) { "$apiName/$($roleDef.value)" } else { "$apiName/$roleId" }
 
-            foreach ($acc in $resource.ResourceAccess) {
-                if ($acc.Type -ne "Role") { continue }
-
-                $roleDef = $targetSP.AppRoles | Where-Object { $_.Id -eq $acc.Id } | Select-Object -First 1
-                if (-not $roleDef) {
-                    Write-Warn "  Role $($acc.Id) introuvable sur $apiName"
-                    continue
-                }
-
-                # Verifier si deja accorde
-                $existing = Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $appSP.Id |
-                    Where-Object { $_.AppRoleId -eq $acc.Id -and $_.ResourceId -eq $targetSP.Id } |
-                    Select-Object -First 1
-
-                if ($existing) {
-                    $null = $skippedRoles.Add("$apiName/$($roleDef.Value) (deja accorde)")
+                $key = "$($targetSP.id)|$roleId"
+                if ($existingIds -contains $key) {
+                    $null = $skippedRoles.Add("$roleName (deja accorde)")
                     continue
                 }
 
                 try {
-                    $null = New-MgServicePrincipalAppRoleAssignment `
-                        -ServicePrincipalId $appSP.Id `
-                        -PrincipalId $appSP.Id `
-                        -ResourceId $targetSP.Id `
-                        -AppRoleId $acc.Id
-                    $null = $grantedRoles.Add("$apiName/$($roleDef.Value)")
+                    $assignBody = @{
+                        principalId = $appSP.id
+                        resourceId  = $targetSP.id
+                        appRoleId   = $roleId
+                    }
+                    Invoke-MgGraphRequest -Method POST `
+                        -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$($appSP.id)/appRoleAssignments" `
+                        -Body ($assignBody | ConvertTo-Json) `
+                        -ContentType "application/json" | Out-Null
+                    $null = $grantedRoles.Add($roleName)
                 } catch {
-                    Write-Warn "  Impossible d accorder $apiName/$($roleDef.Value) : $_"
+                    Write-Warn "  Impossible d accorder $roleName : $_"
                 }
             }
         }
@@ -506,9 +620,8 @@ function Grant-AdminConsent {
             foreach ($r in $skippedRoles) { Write-Host "     = $r" -ForegroundColor DarkGray }
         }
         if ($grantedRoles.Count -eq 0 -and $skippedRoles.Count -eq 0) {
-            Write-Warn "Aucun role a accorder - verifiez les permissions configurees."
+            Write-Warn "Aucun role a accorder."
         }
-
     } catch {
         Write-Warn "Grant automatique echoue : $_"
         Write-Warn "Vous devrez accorder le consentement manuellement."
@@ -541,7 +654,7 @@ function Save-ConfigFile {
         ""
         "`$SPScanConfig = @{"
         "    ClientId   = `"$($Info.AppId)`""
-        "    Thumbprint = `"$($Info.Thumbprint)`""
+        $(if ($Info.AuthMethod -eq "Secret") { "    ClientSecret = `"$($Info.ClientSecret)`"" } else { "    Thumbprint   = `"$($Info.Thumbprint)`"" }),
         "    Tenant     = `"$($Info.TenantDomain)`""
         "}"
         ""
@@ -551,21 +664,21 @@ function Save-ConfigFile {
         "#   .\SPPermissionScanner.ps1 -Mode SingleSite ``"
         "#       -SiteUrl `"https://<tenant>.sharepoint.com/sites/<site>`" ``"
         "#       -ClientId `$SPScanConfig.ClientId ``"
-        "#       -Thumbprint `$SPScanConfig.Thumbprint ``"
+        "#       -Thumbprint `$SPScanConfig.Thumbprint ``  # ou -ClientSecret `$SPScanConfig.ClientSecret"
         "#       -Tenant `$SPScanConfig.Tenant"
         ""
         "# Scan d'une collection de sites :"
         "#   .\SPPermissionScanner.ps1 -Mode SiteCollection ``"
         "#       -SiteUrl `"https://<tenant>.sharepoint.com/sites/<site>`" ``"
         "#       -ClientId `$SPScanConfig.ClientId ``"
-        "#       -Thumbprint `$SPScanConfig.Thumbprint ``"
+        "#       -Thumbprint `$SPScanConfig.Thumbprint ``  # ou -ClientSecret `$SPScanConfig.ClientSecret"
         "#       -Tenant `$SPScanConfig.Tenant"
         ""
         "# Scan de tous les sites du tenant :"
         "#   .\SPPermissionScanner.ps1 -Mode AllSites ``"
         "#       -TenantAdminUrl `"https://<tenant>-admin.sharepoint.com`" ``"
         "#       -ClientId `$SPScanConfig.ClientId ``"
-        "#       -Thumbprint `$SPScanConfig.Thumbprint ``"
+        "#       -Thumbprint `$SPScanConfig.Thumbprint ``  # ou -ClientSecret `$SPScanConfig.ClientSecret"
         "#       -Tenant `$SPScanConfig.Tenant"
         ""
         "# --- SPLAT (pratique pour eviter de retaper les params) ---"
@@ -579,8 +692,15 @@ function Save-ConfigFile {
         "# Certificat PFX  : $($Info.PfxPath)"
         "# Certificat CER  : $($Info.CerPath)"
         "# Scope configure : $($Info.Scope)"
-        "#"
-        "# Azure Portal : https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/~/Overview/appId/$($Info.AppId)"
+        "#",
+        "# Multi-tenant    : $($Info.MultiTenant)",
+        "#",
+        "# Azure Portal : https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/~/Overview/appId/$($Info.AppId)",
+        "#",
+        "# --- MULTI-TENANT : CONSENTEMENT PAR TENANT CIBLE ---",
+        "# Pour chaque tenant cible, le Global Admin doit visiter :",
+        "# https://login.microsoftonline.com/<TENANT>/adminconsent?client_id=$($Info.AppId)",
+        "# Ex: https://login.microsoftonline.com/contoso.onmicrosoft.com/adminconsent?client_id=$($Info.AppId)"
     )
     $config = $lines -join "`r`n"
 
@@ -634,9 +754,23 @@ function Show-Summary {
         Write-Host ""
     }
 
-    Write-Host "  ─── Liens utiles ──────────────────────────────────────────" -ForegroundColor DarkGray
+    Write-Host "  --- Liens utiles ------------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "  Azure Portal (App) : https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/~/Overview/appId/$($Info.AppId)" -ForegroundColor DarkGray
+    Write-Host "  Azure Portal : https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/~/Overview/appId/$($Info.AppId)" -ForegroundColor DarkGray
+
+    if ($Info.MultiTenant) {
+        Write-Host ""
+        Write-Host "  MULTI-TENANT - Consentement par tenant cible :" -ForegroundColor Cyan
+        Write-Host "  Chaque tenant cible doit accorder son consentement admin. Envoyez ce lien au Global Admin du tenant cible :" -ForegroundColor White
+        Write-Host ""
+        Write-Host "  https://login.microsoftonline.com/<TENANT_CIBLE>/adminconsent?client_id=$($Info.AppId)" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  Ex: https://login.microsoftonline.com/client-contoso.onmicrosoft.com/adminconsent?client_id=$($Info.AppId)" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  Puis scanner ce tenant avec :" -ForegroundColor White
+        Write-Host "  .\SPPermissionScanner.ps1 -Mode SingleSite -SiteUrl 'https://contoso.sharepoint.com/...' ``" -ForegroundColor Cyan
+        Write-Host "      -ClientId '$($Info.AppId)' -Thumbprint '$($Info.Thumbprint)' -Tenant 'contoso.onmicrosoft.com'" -ForegroundColor Cyan
+    }
     Write-Host ""
 }
 
@@ -650,8 +784,21 @@ Write-Info "Ce script va créer une App Registration Azure AD pour SPPermissionS
 Write-Info "Durée estimée : 5-10 minutes"
 Write-Host ""
 
-if (-not (Confirm-Step "Démarrer le setup guidé ?")) {
-    Write-Warn "Setup annulé."
+# Avertissement proactif sur le conflit de modules
+if (Get-Module -Name "PnP.PowerShell") {
+    Write-Host ""
+    Write-Host "  ┌─────────────────────────────────────────────────────────────────" -ForegroundColor Yellow
+    Write-Host "  │  ATTENTION : PnP.PowerShell est charge dans cette session." -ForegroundColor Yellow
+    Write-Host "  │  Cela peut causer un conflit avec Microsoft.Graph." -ForegroundColor Yellow
+    Write-Host "  │  Le setup va tenter de le decharger automatiquement." -ForegroundColor Yellow
+    Write-Host "  │  Si une erreur survient, ouvrez une NOUVELLE fenetre PowerShell" -ForegroundColor Yellow
+    Write-Host "  │  et relancez le setup sans rien charger au prealable." -ForegroundColor Yellow
+    Write-Host "  └─────────────────────────────────────────────────────────────────" -ForegroundColor Yellow
+    Write-Host ""
+}
+
+if (-not (Confirm-Step "Demarrer le setup guide ?")) {
+    Write-Warn "Setup annule."
     exit 0
 }
 
@@ -659,7 +806,14 @@ try {
     Test-Prerequisites
 
     [hashtable]$info = Get-SetupInfo
-    [hashtable]$info = New-ScannerCertificate -Info $info
+    if ([string]$info.AuthMethod -eq "Certificate") {
+        [hashtable]$info = New-ScannerCertificate -Info $info
+    } else {
+        Write-Log "Mode Secret - generation de certificat ignoree." -Level INFO
+        $info.Thumbprint = ""
+        $info.PfxPath    = ""
+        $info.CerPath    = ""
+    }
     [string]$tenantId = Connect-ToGraph
     [hashtable]$info = New-AppRegistration -Info $info -TenantId $tenantId
     Grant-AdminConsent -Info $info
