@@ -1,4 +1,3 @@
-#Requires -Modules Microsoft.Graph.Authentication, Microsoft.Graph.Applications, Microsoft.Graph.Identity.DirectoryManagement
 <#
 .SYNOPSIS
     Setup guidé — Crée l'App Registration Azure AD nécessaire pour SPPermissionScanner.ps1
@@ -90,17 +89,40 @@ function Test-Prerequisites {
     # Microsoft.Graph
     $graphMod = Get-Module -ListAvailable -Name "Microsoft.Graph.Applications" | Select-Object -First 1
     if (-not $graphMod) {
-        Write-Warn "Module Microsoft.Graph non trouvé."
+        Write-Warn "Module Microsoft.Graph non trouve."
         if (Confirm-Step "Installer Microsoft.Graph maintenant ?") {
             Write-Info "Installation en cours (peut prendre quelques minutes)..."
             Install-Module Microsoft.Graph -Scope CurrentUser -Force -AllowClobber
-            Write-Ok "Microsoft.Graph installé."
+            Write-Ok "Microsoft.Graph installe."
         } else {
             Write-Err "Microsoft.Graph est requis. Installez-le avec : Install-Module Microsoft.Graph"
             $ok = $false
         }
     } else {
         Write-Ok "Microsoft.Graph $($graphMod.Version)"
+        # Importer les modules Graph en gerant les conflits d assembly avec PnP.PowerShell
+        # PnP.PowerShell embarque sa propre version de Microsoft.Graph.Authentication
+        # ce qui peut causer des conflits si PnP est deja charge dans la session.
+        $graphModules = @(
+            "Microsoft.Graph.Authentication",
+            "Microsoft.Graph.Applications",
+            "Microsoft.Graph.Identity.DirectoryManagement"
+        )
+        foreach ($gm in $graphModules) {
+            if (-not (Get-Module -Name $gm)) {
+                try {
+                    Import-Module $gm -ErrorAction Stop -WarningAction SilentlyContinue
+                } catch {
+                    if ($_.Exception.Message -like "*Assembly*already loaded*" -or
+                        $_.Exception.Message -like "*Could not load file or assembly*") {
+                        Write-Warn "Conflit d assembly pour $gm (non bloquant)."
+                        Write-Warn "Si des erreurs suivent, fermez PowerShell, rouvrez-le et relancez le setup."
+                    } else {
+                        throw
+                    }
+                }
+            }
+        }
     }
 
     # PnP.PowerShell
