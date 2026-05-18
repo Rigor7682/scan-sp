@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SP Permissions Report</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{font-family:Inter,sans-serif;background:#f8fafc;color:#1e293b;font-size:13px;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+.header{background:#fff;border-bottom:1px solid #e2e8f0;padding:0 20px;height:54px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+.brand{display:flex;align-items:center;gap:10px}
+.logo{width:32px;height:32px;background:linear-gradient(135deg,#2563eb,#7c3aed);border-radius:7px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;color:#fff}
+.brand-title{font-size:15px;font-weight:700;color:#0f172a}.brand-title span{color:#2563eb}
+.brand-sub{font-size:10px;color:#94a3b8;font-family:'JetBrains Mono',monospace;margin-top:1px}
+.stats{display:flex;gap:3px}
+.stat{background:#f1f5f9;border:1px solid #e2e8f0;border-radius:5px;padding:5px 12px;text-align:center;min-width:60px}
+.stat-n{font-size:15px;font-weight:700;line-height:1}.stat-l{font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;margin-top:2px}
+.s-blue .stat-n{color:#2563eb}.s-warn .stat-n{color:#d97706}.s-red .stat-n{color:#dc2626}.s-crit .stat-n{color:#dc2626;font-weight:800}.s-green .stat-n{color:#16a34a}
+.tabs{background:#fff;border-bottom:1px solid #e2e8f0;display:flex;padding:0 16px;flex-shrink:0}
+.tab{padding:10px 16px;cursor:pointer;font-size:12px;font-weight:600;color:#64748b;border-bottom:2px solid transparent;transition:all .15s;white-space:nowrap}
+.tab:hover{color:#1e293b}.tab.on{color:#2563eb;border-bottom-color:#2563eb}
+.tab-panel{display:none;flex:1;overflow:hidden;flex-direction:column}.tab-panel.on{display:flex}
+.toolbar{background:#fff;border-bottom:1px solid #e2e8f0;padding:7px 14px;display:flex;align-items:center;gap:5px;flex-wrap:wrap;flex-shrink:0}
+.btn{padding:4px 12px;border-radius:5px;border:1px solid #e2e8f0;background:#f8fafc;color:#64748b;cursor:pointer;font-size:11px;font-weight:600;font-family:Inter,sans-serif;transition:all .15s;white-space:nowrap}
+.btn:hover,.btn.on{border-color:#2563eb;color:#2563eb;background:#eff6ff}
+.btn-warn{border-color:#fcd34d;color:#d97706}.btn-warn:hover,.btn-warn.on{background:#fffbeb;border-color:#d97706}
+.btn-crit{border-color:#fca5a5;color:#dc2626}.btn-crit:hover,.btn-crit.on{background:#fef2f2;border-color:#dc2626}
+.btn-ok{border-color:#86efac;color:#16a34a}.btn-ok:hover{background:#f0fdf4;border-color:#16a34a}
+.sep{width:1px;height:18px;background:#e2e8f0;flex-shrink:0}
+.search{margin-left:auto;background:#f8fafc;border:1px solid #e2e8f0;border-radius:5px;color:#1e293b;padding:5px 10px;font-family:'JetBrains Mono',monospace;font-size:11px;width:200px;outline:none;transition:border-color .15s,width .2s}
+.search:focus{border-color:#2563eb;width:260px}
+.table-wrap{flex:1;overflow:auto}
+table{width:100%;border-collapse:collapse}
+thead{background:#f8fafc;position:sticky;top:0;z-index:10;border-bottom:2px solid #e2e8f0}
+th{padding:8px 12px;text-align:left;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:#94a3b8;white-space:nowrap;cursor:pointer;user-select:none;border-bottom:1px solid #e2e8f0}
+th:hover{color:#1e293b}th.sorted{color:#2563eb}
+td{padding:7px 12px;border-bottom:1px solid #f1f5f9;vertical-align:middle}
+tr.uniq td{background:#fffbeb}tr:hover td{background:#f8fafc}tr.uniq:hover td{background:#fef9c3}
+tr.added td{background:#f0fdf4}tr.removed td{background:#fef2f2}
+.badge{display:inline-block;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:700;text-transform:uppercase;white-space:nowrap}
+.b-site{background:#ede9fe;color:#6d28d9;border:1px solid #c4b5fd}
+.b-lib{background:#e0f2fe;color:#0369a1;border:1px solid #bae6fd}
+.b-list{background:#fff7ed;color:#c2410c;border:1px solid #fed7aa}
+.b-fold{background:#f0fdf4;color:#15803d;border:1px solid #bbf7d0}
+.b-file{background:#faf5ff;color:#7e22ce;border:1px solid #e9d5ff}
+.b-uniq{background:#fffbeb;color:#d97706;border:1px solid #fcd34d}
+.b-inh{background:#f8fafc;color:#94a3b8;border:1px solid #e2e8f0}
+.b-user{background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe}
+.b-sp{background:#f0fdf4;color:#15803d;border:1px solid #bbf7d0}
+.b-sec{background:#faf5ff;color:#7e22ce;border:1px solid #e9d5ff}
+.b-add{background:#f0fdf4;color:#16a34a;border:1px solid #86efac}
+.b-del{background:#fef2f2;color:#dc2626;border:1px solid #fca5a5}
+.perm{display:inline-block;padding:2px 7px;border-radius:3px;font-size:10px;font-family:'JetBrains Mono',monospace;white-space:nowrap}
+.p-full{color:#991b1b;background:#fef2f2;border:1px solid #fca5a5}
+.p-edit{color:#92400e;background:#fffbeb;border:1px solid #fcd34d}
+.p-contrib{color:#1e40af;background:#eff6ff;border:1px solid #bfdbfe}
+.p-read{color:#166534;background:#f0fdf4;border:1px solid #86efac}
+.p-other{color:#64748b;background:#f8fafc;border:1px solid #e2e8f0}
+.risk-ok{color:#16a34a;font-size:10px}.risk-crit{color:#dc2626;font-weight:700;font-size:10px}
+.risk-high{color:#dc2626;font-size:10px}.risk-med{color:#d97706;font-size:10px}
+.obj-url{font-family:'JetBrains Mono',monospace;font-size:10px;color:#94a3b8;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px}
+a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}
+.user-cards{overflow:auto;flex:1;padding:12px 16px;background:#f8fafc}
+.user-card{background:#fff;border:1px solid #e2e8f0;border-radius:8px;margin-bottom:8px;padding:12px 16px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+.user-name{font-size:13px;font-weight:600;color:#0f172a}.user-login{font-family:'JetBrains Mono',monospace;font-size:10px;color:#94a3b8;margin-top:2px}
+.user-stats{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}
+.ust{font-size:10px;padding:2px 8px;border-radius:10px;border:1px solid #e2e8f0;background:#f8fafc;color:#64748b}
+.utog{cursor:pointer;float:right;color:#2563eb;font-size:11px;font-weight:600}
+.user-objs{margin-top:10px;display:none;border-top:1px solid #f1f5f9;padding-top:8px}
+.user-card.open .user-objs{display:block}
+.urow{padding:5px 4px;border-bottom:1px solid #f8fafc;font-size:12px;display:flex;align-items:center;gap:8px}
+.urow:last-child{border-bottom:none}
+.empty{display:none;padding:80px;text-align:center;color:#94a3b8;font-size:14px}
+.empty-icon{font-size:32px;margin-bottom:8px;opacity:.5}
+.loading{padding:60px;text-align:center;color:#94a3b8}
+.loading-spinner{width:32px;height:32px;border:3px solid #e2e8f0;border-top-color:#2563eb;border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 12px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.diff-legend{padding:8px 16px;font-size:11px;color:#64748b;background:#f8fafc;border-bottom:1px solid #e2e8f0;display:flex;gap:16px;align-items:center;flex-shrink:0}
+.footer{background:#fff;border-top:1px solid #e2e8f0;padding:5px 16px;display:flex;justify-content:space-between;font-family:'JetBrains Mono',monospace;font-size:10px;color:#94a3b8;flex-shrink:0}
+::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:#f8fafc}::-webkit-scrollbar-thumb{background:#e2e8f0;border-radius:3px}::-webkit-scrollbar-thumb:hover{background:#cbd5e1}
+</style>
+</head>
+<body>
+<header class="header">
+  <div class="brand"><div class="logo">SP</div><div>
+    <div class="brand-title">SharePoint <span>Permissions</span></div>
+    <div class="brand-sub" id="meta-sub">Chargement...</div>
+  </div></div>
+  <div class="stats">
+    <div class="stat s-blue"><div class="stat-n" id="s-sites">-</div><div class="stat-l">Sites</div></div>
+    <div class="stat"><div class="stat-n" id="s-rows">-</div><div class="stat-l">Lignes</div></div>
+    <div class="stat s-warn"><div class="stat-n" id="s-uniq">-</div><div class="stat-l">Uniques</div></div>
+    <div class="stat s-crit"><div class="stat-n" id="s-crit">-</div><div class="stat-l">Critiques</div></div>
+    <div class="stat s-red"><div class="stat-n" id="s-high">-</div><div class="stat-l">Eleves</div></div>
+    <div class="stat s-green" id="s-add-w" style="display:none"><div class="stat-n" id="s-add">-</div><div class="stat-l">Ajoutes</div></div>
+  </div>
+</header>
+<div class="tabs">
+  <div class="tab on" onclick="showTab('perms',this)">Permissions</div>
+  <div class="tab" onclick="showTab('users',this)">Vue utilisateur</div>
+  <div class="tab" id="tab-risks-btn" onclick="showTab('risks',this)">Risques</div>
+  <div class="tab" id="tab-diff-btn" style="display:none" onclick="showTab('diff',this)">Comparaison</div>
+</div>
+<!-- TAB PERMISSIONS -->
+<div class="tab-panel on" id="tab-perms">
+  <div class="toolbar">
+    <button class="btn on" onclick="setType('all',this)">Tous</button>
+    <button class="btn" style="color:#6d28d9;border-color:#c4b5fd" onclick="setType('Site',this)">Sites</button>
+    <button class="btn" style="color:#0369a1;border-color:#bae6fd" onclick="setType('Library',this)">Libraries</button>
+    <button class="btn" style="color:#c2410c;border-color:#fed7aa" onclick="setType('List',this)">Listes</button>
+    <button class="btn" style="color:#15803d;border-color:#bbf7d0" onclick="setType('Folder',this)">Dossiers</button>
+    <button class="btn" style="color:#7e22ce;border-color:#e9d5ff" onclick="setType('File',this)">Fichiers</button>
+    <div class="sep"></div>
+    <button class="btn btn-warn" id="btn-uniq" onclick="toggleUniq()">Uniques seulement</button>
+    <div class="sep"></div>
+    <button class="btn btn-ok" onclick="exportTable('main-tbl')">Export CSV</button>
+    <button class="btn" style="border-color:#7c3aed;color:#7c3aed" onclick="exportHTML()">Export HTML</button>
+    <input class="search" id="search" type="text" placeholder="Rechercher..." oninput="render()">
+  </div>
+  <div class="table-wrap">
+    <div class="loading" id="loading"><div class="loading-spinner"></div>Chargement du rapport...</div>
+    <div class="empty" id="empty"><div class="empty-icon">&#128269;</div>Aucun resultat.</div>
+    <table id="main-tbl" style="display:none">
+      <thead><tr>
+        <th onclick="sort('ObjectType')">Type</th>
+        <th onclick="sort('ObjectName')">Objet</th>
+        <th onclick="sort('HasUniquePermissions')">Permissions</th>
+        <th onclick="sort('Principal')">Principal</th>
+        <th onclick="sort('PrincipalType')">Type principal</th>
+        <th onclick="sort('PermissionLevel')">Niveau</th>
+        <th onclick="sort('Risk')">Risque</th>
+        <th onclick="sort('SiteName')">Site</th>
+      </tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+</div>
+<!-- TAB USERS -->
+<div class="tab-panel" id="tab-users">
+  <div class="toolbar">
+    <input class="search" id="s-users" type="text" placeholder="Filtrer par utilisateur..." oninput="filterUsers()" style="margin-left:0;width:280px">
+    <div class="sep"></div>
+    <button class="btn btn-ok" onclick="exportTable('user-tbl')">Export CSV</button>
+  </div>
+  <div class="user-cards" id="user-cards"><div class="loading"><div class="loading-spinner"></div>Chargement...</div></div>
+  <table id="user-tbl" style="display:none">
+    <thead><tr><th>Principal</th><th>Login</th><th>Type</th><th>ObjectType</th><th>Objet</th><th>Niveau</th><th>Unique</th><th>Site</th></tr></thead>
+    <tbody id="user-tbody"></tbody>
+  </table>
+</div>
+<!-- TAB RISKS -->
+<div class="tab-panel" id="tab-risks">
+  <div class="toolbar">
+    <button class="btn on" onclick="setRisk('all',this)">Tous</button>
+    <button class="btn btn-crit" onclick="setRisk('CRITIQUE',this)">Critiques</button>
+    <button class="btn btn-crit" onclick="setRisk('ELEVE',this)">Eleves</button>
+    <button class="btn btn-warn" onclick="setRisk('MOYEN',this)">Moyens</button>
+    <div class="sep"></div>
+    <button class="btn btn-ok" onclick="exportTable('risk-tbl')">Export CSV</button>
+    <input class="search" id="s-risk" type="text" placeholder="Rechercher..." oninput="filterRisks()">
+  </div>
+  <div class="table-wrap">
+    <div class="empty" id="empty-risk" style="display:none"><div class="empty-icon">&#10003;</div>Aucun risque detecte.</div>
+    <table id="risk-tbl">
+      <thead><tr><th>Risque</th><th>Type</th><th>Objet</th><th>Principal</th><th>Type principal</th><th>Niveau</th><th>Site</th></tr></thead>
+      <tbody id="risk-tbody"></tbody>
+    </table>
+  </div>
+</div>
+<!-- TAB DIFF -->
+<div class="tab-panel" id="tab-diff">
+  <div class="diff-legend">
+    <span style="color:#16a34a;font-weight:600">+ Ajoute</span>
+    <span style="color:#dc2626;font-weight:600">- Supprime</span>
+    <span>Permissions ajoutees ou supprimees depuis le scan precedent</span>
+    <button class="btn btn-ok" style="margin-left:auto" onclick="exportTable('diff-tbl')">Export CSV</button>
+  </div>
+  <div class="table-wrap">
+    <div class="empty" id="empty-diff" style="display:none"><div class="empty-icon">&#10003;</div>Aucune difference.</div>
+    <table id="diff-tbl">
+      <thead><tr><th>Changement</th><th>Type</th><th>Objet</th><th>Principal</th><th>Niveau</th><th>Risque</th><th>Site</th></tr></thead>
+      <tbody id="diff-tbody"></tbody>
+    </table>
+  </div>
+</div>
+<div class="footer">
+  <span>SP Permission Scanner v1.0</span>
+  <span id="f-count">-</span>
+</div>
+<script>
+var CSV_FILE='__CSV_FILENAME__';
+var META=__META_JSON__;
+var DIFF_ADDED=__DIFF_ADDED__;
+var DIFF_REMOVED=__DIFF_REMOVED__;
+var HAS_COMPARE=__HAS_COMPARE__;
+var DATA=[],tf='all',uo=false,sf='ObjectType',sa=true,rf='all';
+
+window.addEventListener('DOMContentLoaded',function(){
+  document.getElementById('meta-sub').textContent=(META.generatedAt||'')+' | Mode: '+(META.mode||'')+' | Depth: '+(META.scanDepth||'')+' | '+(META.duration||0)+'s';
+  if(HAS_COMPARE){document.getElementById('tab-diff-btn').style.display='';document.getElementById('s-add-w').style.display='';}
+
+  // Si les donnees sont deja embarquees (export HTML autonome), les utiliser directement
+  if(window.__EMBEDDED__ && window.__EMBEDDED__.data){
+    DATA=window.__EMBEDDED__.data;
+    if(window.__EMBEDDED__.added)  DIFF_ADDED=window.__EMBEDDED__.added;
+    if(window.__EMBEDDED__.removed)DIFF_REMOVED=window.__EMBEDDED__.removed;
+    computeStats();render();buildUsers();buildRisks();if(HAS_COMPARE)buildDiff();
+    document.getElementById('loading').style.display='none';
+    document.getElementById('main-tbl').style.display='';
+    return;
+  }
+
+  // Sinon charger depuis le CSV (mode serveur)
+  fetch(CSV_FILE).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.text();})
+  .then(function(txt){
+    DATA=parseCSV(txt);
+    computeStats();render();buildUsers();buildRisks();if(HAS_COMPARE)buildDiff();
+    document.getElementById('loading').style.display='none';
+    document.getElementById('main-tbl').style.display='';
+  }).catch(function(e){
+    document.getElementById('loading').innerHTML='<div style="color:#dc2626;padding:20px">Erreur chargement CSV: '+e+'<br><small>Ouvrez via http://localhost:8080/reports/'+CSV_FILE+'</small></div>';
+  });
+});
+
+function parseCSV(text){
+  var lines=text.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n');
+  var headers=splitLine(lines[0]),result=[];
+  for(var i=1;i<lines.length;i++){if(!lines[i].trim())continue;var vals=splitLine(lines[i]),obj={};for(var j=0;j<headers.length;j++)obj[headers[j]]=vals[j]||'';result.push(obj);}
+  return result;
+}
+function splitLine(line){
+  var result=[],cur='',inQ=false;
+  for(var i=0;i<line.length;i++){var c=line[i];if(c==='"'){if(inQ&&line[i+1]==='"'){cur+='"';i++;}else inQ=!inQ;}else if(c===','&&!inQ){result.push(cur);cur='';}else cur+=c;}
+  result.push(cur);return result;
+}
+function computeStats(){
+  var sites={},uniq=0,crit=0,high=0,med=0;
+  DATA.forEach(function(r){sites[r.SiteName]=1;if(r.HasUniquePermissions==='True')uniq++;var rk=r.Risk||'';if(rk.startsWith('CRITIQUE'))crit++;else if(rk.startsWith('ELEVE'))high++;else if(rk.startsWith('MOYEN'))med++;});
+  document.getElementById('s-sites').textContent=Object.keys(sites).length;
+  document.getElementById('s-rows').textContent=DATA.length;
+  document.getElementById('s-uniq').textContent=uniq;
+  document.getElementById('s-crit').textContent=crit;
+  document.getElementById('s-high').textContent=high;
+  document.getElementById('f-count').textContent=DATA.length+' lignes';
+  document.getElementById('tab-risks-btn').textContent='Risques ('+(crit+high+med)+')';
+  if(HAS_COMPARE){document.getElementById('s-add').textContent='+'+DIFF_ADDED.length;}
+}
+function filtered(){
+  var q=(document.getElementById('search').value||'').toLowerCase();
+  return DATA.filter(function(r){
+    if(tf!=='all'&&r.ObjectType!==tf)return false;
+    if(uo&&r.HasUniquePermissions!=='True')return false;
+    if(q){var f=[r.ObjectName,r.Principal,r.SiteName,r.PermissionLevel,r.LoginName,r.ObjectUrl],ok=false;for(var i=0;i<f.length;i++)if((f[i]||'').toLowerCase().indexOf(q)!==-1){ok=true;break;}if(!ok)return false;}
+    return true;
+  }).sort(function(a,b){var av=(a[sf]||'').toLowerCase(),bv=(b[sf]||'').toLowerCase();return sa?(av<bv?-1:av>bv?1:0):(av>bv?-1:av<bv?1:0);});
+}
+function render(){
+  var rows=filtered(),tbody=document.getElementById('tbody'),empty=document.getElementById('empty');
+  document.getElementById('f-count').textContent=rows.length+' lignes';
+  if(!rows.length){tbody.innerHTML='';empty.style.display='block';return;}
+  empty.style.display='none';
+  var h='';
+  for(var i=0;i<rows.length;i++){
+    var r=rows[i],u=r.HasUniquePermissions==='True';
+    h+='<tr class="'+(u?'uniq':'')+'">';
+    h+='<td>'+typeBadge(r.ObjectType)+'</td>';
+    h+='<td><div><a href="'+esc(r.ObjectUrl)+'" target="_blank">'+esc(r.ObjectName)+'</a></div><div class="obj-url">'+esc(r.ObjectUrl)+'</div></td>';
+    h+='<td>'+(u?'<span class="badge b-uniq">Unique</span>':'<span class="badge b-inh">Herite</span>');
+    if(!u&&r.InheritedFrom)h+=' <small style="color:#94a3b8">de '+esc(r.InheritedFrom)+'</small>';
+    h+='</td>';
+    h+='<td>'+esc(r.Principal||'-')+'</td>';
+    h+='<td>'+ptBadge(r.PrincipalType)+'</td>';
+    h+='<td>'+permBadge(r.PermissionLevel)+'</td>';
+    h+='<td>'+riskBadge(r.Risk)+'</td>';
+    h+='<td style="color:#94a3b8;font-size:11px">'+esc(r.SiteName)+'</td></tr>';
+  }
+  tbody.innerHTML=h;
+}
+function setType(t,btn){tf=t;document.querySelectorAll('#tab-perms .toolbar .btn:not(.btn-warn):not(.btn-ok)').forEach(function(b){b.classList.remove('on');});btn.classList.add('on');render();}
+function toggleUniq(){uo=!uo;document.getElementById('btn-uniq').classList.toggle('on',uo);render();}
+function sort(f){if(sf===f)sa=!sa;else{sf=f;sa=true;}render();}
+function showTab(id,btn){document.querySelectorAll('.tab-panel').forEach(function(p){p.classList.remove('on');});document.querySelectorAll('.tab').forEach(function(b){b.classList.remove('on');});document.getElementById('tab-'+id).classList.add('on');btn.classList.add('on');}
+function buildUsers(){
+  var users={};
+  DATA.forEach(function(r){var p=r.Principal,l=r.LoginName,t=r.PrincipalType;if(!p||p==='(inherited)'||p==='(no assignments)')return;var key=l||p;if(!users[key])users[key]={name:p,login:l,type:t,items:[]};users[key].items.push({ot:r.ObjectType,name:r.ObjectName,url:r.ObjectUrl,lvl:r.PermissionLevel,hu:r.HasUniquePermissions,site:r.SiteName,risk:r.Risk});});
+  var keys=Object.keys(users).sort(),h='',th='';
+  keys.forEach(function(key,i){
+    var u=users[key],risks=u.items.filter(function(x){return x.risk&&x.risk!=='OK';}).length,uniqN=u.items.filter(function(x){return x.hu==='True';}).length,tb=u.type==='User'?'b-user':u.type==='SP Group'?'b-sp':'b-sec';
+    h+='<div class="user-card" id="uc-'+i+'"><span class="utog" onclick="togCard('+i+')">&#9654; '+u.items.length+' acces</span>';
+    h+='<div class="user-name"><span class="badge '+tb+'" style="margin-right:6px">'+esc(u.type)+'</span>'+esc(u.name)+'</div>';
+    h+='<div class="user-login">'+esc(u.login)+'</div>';
+    h+='<div class="user-stats"><span class="ust">'+u.items.length+' objets</span><span class="ust">'+uniqN+' uniques</span>';
+    if(risks)h+='<span class="ust" style="color:#dc2626;border-color:#fca5a5">'+risks+' risque(s)</span>';
+    h+='</div><div class="user-objs" id="uo-'+i+'">';
+    u.items.forEach(function(it){var otc=it.ot.toLowerCase().replace('library','lib');h+='<div class="urow"><span class="badge b-'+otc+'" style="flex-shrink:0">'+esc(it.ot)+'</span><a href="'+esc(it.url)+'" target="_blank" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(it.name)+'</a><span class="perm '+lvlClass(it.lvl)+'" style="flex-shrink:0">'+esc(it.lvl)+'</span>'+(it.risk&&it.risk!=='OK'?'<span style="color:#dc2626;font-size:10px" title="'+esc(it.risk)+'">&#9888;</span>':'')+'</div>';th+='<tr><td>'+esc(u.name)+'</td><td>'+esc(u.login)+'</td><td>'+esc(u.type)+'</td><td>'+esc(it.ot)+'</td><td>'+esc(it.name)+'</td><td>'+esc(it.lvl)+'</td><td>'+esc(it.hu)+'</td><td>'+esc(it.site)+'</td></tr>';});
+    h+='</div></div>';
+  });
+  document.getElementById('user-cards').innerHTML=h||'<div class="loading">Aucun utilisateur.</div>';
+  document.getElementById('user-tbody').innerHTML=th;
+}
+function togCard(i){var c=document.getElementById('uc-'+i),t=c.querySelector('.utog'),n=c.classList.toggle('open');t.innerHTML=(n?'&#9660;':'&#9654;')+' '+c.querySelectorAll('.urow').length+' acces';}
+function filterUsers(){var q=(document.getElementById('s-users').value||'').toLowerCase();document.querySelectorAll('.user-card').forEach(function(c){c.style.display=(!q||c.textContent.toLowerCase().indexOf(q)!==-1)?'':'none';});}
+function buildRisks(){
+  var rows=DATA.filter(function(r){return r.Risk&&r.Risk!=='OK'&&r.Risk!=='';});
+  if(!rows.length){document.getElementById('empty-risk').style.display='block';document.getElementById('risk-tbl').style.display='none';return;}
+  var h='';rows.forEach(function(r){h+='<tr data-risk="'+esc(r.Risk)+'"><td>'+riskBadge(r.Risk)+'</td><td>'+typeBadge(r.ObjectType)+'</td><td><a href="'+esc(r.ObjectUrl)+'" target="_blank">'+esc(r.ObjectName)+'</a></td><td>'+esc(r.Principal)+'</td><td>'+ptBadge(r.PrincipalType)+'</td><td>'+permBadge(r.PermissionLevel)+'</td><td style="color:#94a3b8;font-size:11px">'+esc(r.SiteName)+'</td></tr>';});
+  document.getElementById('risk-tbody').innerHTML=h;
+}
+function setRisk(l,btn){rf=l;document.querySelectorAll('#tab-risks .toolbar .btn:not(.btn-ok)').forEach(function(b){b.classList.remove('on');});btn.classList.add('on');filterRisks();}
+function filterRisks(){var q=(document.getElementById('s-risk').value||'').toLowerCase();document.querySelectorAll('#risk-tbody tr').forEach(function(tr){var ok=(rf==='all'||tr.dataset.risk.startsWith(rf))&&(!q||tr.textContent.toLowerCase().indexOf(q)!==-1);tr.style.display=ok?'':'none';});}
+function buildDiff(){
+  var all=[];DIFF_ADDED.forEach(function(r){r._c='A';all.push(r);});DIFF_REMOVED.forEach(function(r){r._c='R';all.push(r);});
+  if(!all.length){document.getElementById('empty-diff').style.display='block';document.getElementById('diff-tbl').style.display='none';return;}
+  var h='';all.forEach(function(r){var cls=r._c==='A'?'added':'removed',b=r._c==='A'?'<span class="badge b-add">+ Ajoute</span>':'<span class="badge b-del">- Supprime</span>';h+='<tr class="'+cls+'"><td>'+b+'</td><td>'+typeBadge(r.ObjectType||'')+'</td><td><a href="'+esc(r.ObjectUrl||'')+'" target="_blank">'+esc(r.ObjectName||'')+'</a></td><td>'+esc(r.Principal||'')+'</td><td>'+permBadge(r.PermissionLevel||'')+'</td><td>'+riskBadge(r.Risk||'OK')+'</td><td style="color:#94a3b8;font-size:11px">'+esc(r.SiteName||'')+'</td></tr>';});
+  document.getElementById('diff-tbody').innerHTML=h;
+}
+function typeBadge(t){var m={Site:'b-site',Library:'b-lib',List:'b-list',Folder:'b-fold',File:'b-file'};return '<span class="badge '+(m[t]||'b-lib')+'">'+( t||'?')+'</span>';}
+function ptBadge(t){if(t==='User')return '<span class="badge b-user">User</span>';if(t==='SP Group')return '<span class="badge b-sp">SP Group</span>';if(t==='Security Group')return '<span class="badge b-sec">Sec Group</span>';return '<span class="badge b-inh">'+(t||'-')+'</span>';}
+function permBadge(l){if(!l||l==='-')return '<span style="color:#94a3b8">-</span>';return '<span class="perm '+lvlClass(l)+'">'+esc(l)+'</span>';}
+function riskBadge(r){if(!r||r==='OK')return '<span class="risk-ok">OK</span>';if(r.startsWith('CRITIQUE'))return '<span class="risk-crit">'+esc(r)+'</span>';if(r.startsWith('ELEVE'))return '<span class="risk-high">'+esc(r)+'</span>';return '<span class="risk-med">'+esc(r)+'</span>';}
+function lvlClass(l){var s=(l||'').toLowerCase();if(s.indexOf('full control')!==-1)return 'p-full';if(s.indexOf('edit')!==-1||s.indexOf('design')!==-1)return 'p-edit';if(s.indexOf('contribut')!==-1)return 'p-contrib';if(s.indexOf('read')!==-1||s.indexOf('view')!==-1)return 'p-read';return 'p-other';}
+function exportTable(id){var tbl=document.getElementById(id);if(!tbl)return;var hs=Array.from(tbl.querySelectorAll('thead th')).map(function(h){return '"'+h.textContent.trim()+'"';});var rows=[hs.join(',')];tbl.querySelectorAll('tbody tr').forEach(function(tr){if(tr.style.display==='none')return;rows.push(Array.from(tr.querySelectorAll('td')).map(function(c){return '"'+c.textContent.trim().replace(/"/g,'""')+'"';}).join(','));});var a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['\uFEFF'+rows.join('\n')],{type:'text/csv;charset=utf-8;'}));a.download='sp-export-'+id+'.csv';a.click();}
+function esc(s){if(!s)return '';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+
+function exportHTML(){
+  // Creer un HTML autonome avec les donnees embarquees (pas besoin du CSV)
+  var html=document.documentElement.outerHTML;
+
+  // Injecter les donnees comme variable globale avant </head>
+  var embedded={data:DATA,meta:META,added:DIFF_ADDED,removed:DIFF_REMOVED};
+  var script='<script id="_emb">window.__EMBEDDED__='+JSON.stringify(embedded)+';<\/script>';
+  html=html.replace('</head>',script+'</head>');
+
+  // Supprimer l injection precedente si re-export d un fichier deja exporte
+  html=html.replace(/<script id="_emb">.*?<\/script>/g,'');
+  // Re-injecter proprement
+  var embedded2={data:DATA,meta:META,added:DIFF_ADDED,removed:DIFF_REMOVED};
+  var script2='<script id="_emb">window.__EMBEDDED__='+JSON.stringify(embedded2)+';<\/script>';
+  html=html.replace('</head>',script2+'</head>');
+
+  var fname='SPPermissions_export_'+new Date().toISOString().slice(0,10)+'.html';
+  var a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([html],{type:'text/html;charset=utf-8'}));
+  a.download=fname;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+</script>
+</body>
+</html>
