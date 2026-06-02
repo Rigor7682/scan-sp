@@ -52,6 +52,7 @@ tr.added td{background:#f0fdf4}tr.removed td{background:#fef2f2}
 .b-sec{background:#faf5ff;color:#7e22ce;border:1px solid #e9d5ff}
 .b-add{background:#f0fdf4;color:#16a34a;border:1px solid #86efac}
 .b-del{background:#fef2f2;color:#dc2626;border:1px solid #fca5a5}
+.b-share{background:#fef2f2;color:#e11d48;border:1px solid #fbcfe8}
 .perm{display:inline-block;padding:2px 7px;border-radius:3px;font-size:10px;font-family:'JetBrains Mono',monospace;white-space:nowrap}
 .p-full{color:#991b1b;background:#fef2f2;border:1px solid #fca5a5}
 .p-edit{color:#92400e;background:#fffbeb;border:1px solid #fcd34d}
@@ -130,6 +131,44 @@ a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}
 .site-group.collapsed .chevron{transform:rotate(-90deg)}
 .site-count{margin-left:auto;font-family:'JetBrains Mono',monospace;font-size:10px;color:#94a3b8;font-weight:400}
 .site-group.collapsed tbody.site-body{display:none}
+
+/* ── SITE SIDEBAR ── */
+.layout{display:flex;flex:1;overflow:hidden}
+.site-sidebar{width:230px;background:#fff;border-right:1px solid #e2e8f0;display:flex;flex-direction:column;flex-shrink:0;overflow:hidden}
+.ss-head{padding:10px 14px;border-bottom:1px solid #e2e8f0;font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em}
+.ss-search{padding:8px 10px;border-bottom:1px solid #f1f5f9}
+.ss-search input{width:100%;background:#f8fafc;border:1px solid #e2e8f0;border-radius:5px;padding:5px 8px;font-size:11px;outline:none;font-family:'JetBrains Mono',monospace}
+.ss-search input:focus{border-color:#2563eb}
+.ss-list{flex:1;overflow-y:auto;padding:4px 0}
+.ss-item{padding:7px 14px;cursor:pointer;font-size:12px;color:#475569;display:flex;align-items:center;justify-content:space-between;gap:8px;border-left:3px solid transparent;transition:all .12s}
+.ss-item:hover{background:#f8fafc}
+.ss-item.on{background:#eff6ff;border-left-color:#2563eb;color:#2563eb;font-weight:600}
+.ss-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ss-badge{flex-shrink:0;font-family:'JetBrains Mono',monospace;font-size:9px;color:#94a3b8;background:#f1f5f9;padding:1px 6px;border-radius:8px}
+.ss-item.on .ss-badge{background:#dbeafe;color:#2563eb}
+.ss-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.ss-dot.risk{background:#dc2626}.ss-dot.ok{background:#16a34a}
+.tab-content-area{flex:1;display:flex;flex-direction:column;overflow:hidden}
+
+/* ── PRINT / PDF (resume executif) ── */
+@media print {
+  body * { visibility: hidden; }
+  #print-summary, #print-summary * { visibility: visible; }
+  #print-summary { position: absolute; left: 0; top: 0; width: 100%; padding: 20px; }
+  .header, .tabs, .toolbar, .site-sidebar, .footer { display: none !important; }
+}
+#print-summary { display: none; }
+.ps-header{display:flex;align-items:center;justify-content:space-between;border-bottom:2px solid #2563eb;padding-bottom:12px;margin-bottom:20px}
+.ps-title{font-size:22px;font-weight:800;color:#0f172a}
+.ps-meta{font-size:11px;color:#64748b;font-family:monospace}
+.ps-section{margin-bottom:20px}
+.ps-section h2{font-size:14px;color:#2563eb;border-bottom:1px solid #e2e8f0;padding-bottom:4px;margin-bottom:10px}
+.ps-kpis{display:flex;gap:20px;margin-bottom:16px}
+.ps-kpi{text-align:center}.ps-kpi .n{font-size:28px;font-weight:800}.ps-kpi .l{font-size:10px;color:#64748b;text-transform:uppercase}
+.ps-insight{padding:5px 0;font-size:13px}
+.ps-table{width:100%;border-collapse:collapse;font-size:12px}
+.ps-table th{text-align:left;padding:5px;border-bottom:1px solid #e2e8f0;color:#64748b;font-size:10px;text-transform:uppercase}
+.ps-table td{padding:5px;border-bottom:1px solid #f1f5f9}
 </style>
 </head>
 <body>
@@ -163,6 +202,13 @@ a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}
 </div>
 <!-- TAB PERMISSIONS -->
 <div class="tab-panel" id="tab-perms">
+ <div class="layout">
+  <div class="site-sidebar">
+    <div class="ss-head">Sites</div>
+    <div class="ss-search"><input type="text" id="ss-search" placeholder="Filtrer les sites..." oninput="filterSiteList()"></div>
+    <div class="ss-list" id="ss-list"></div>
+  </div>
+  <div class="tab-content-area">
   <div class="toolbar">
     <button class="btn on" onclick="setType('all',this)">Tous</button>
     <button class="btn" style="color:#6d28d9;border-color:#c4b5fd" onclick="setType('Site',this)">Sites</button>
@@ -176,6 +222,7 @@ a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}
     <div class="sep"></div>
     <button class="btn btn-ok" onclick="exportTable('main-tbl')">Export CSV</button>
     <button class="btn" style="border-color:#7c3aed;color:#7c3aed" onclick="exportHTML()">Export HTML</button>
+    <button class="btn" style="border-color:#dc2626;color:#dc2626" onclick="exportPDF()">Resume PDF</button>
     <input class="search" id="search" type="text" placeholder="Rechercher..." oninput="render()">
   </div>
   <div class="table-wrap">
@@ -195,6 +242,8 @@ a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}
       <tbody id="tbody"></tbody>
     </table>
   </div>
+  </div><!-- tab-content-area -->
+ </div><!-- layout -->
 </div>
 <!-- TAB USERS -->
 <div class="tab-panel" id="tab-users">
@@ -255,7 +304,7 @@ var DIFF_ADDED=__DIFF_ADDED__;
 var DIFF_REMOVED=__DIFF_REMOVED__;
 var HAS_COMPARE=__HAS_COMPARE__;
 var GROUP_MEMBERS=__GROUP_MEMBERS__;
-var DATA=[],tf='all',uo=false,sf='ObjectType',sa=true,rf='all',go=false;
+var DATA=[],tf='all',uo=false,sf='ObjectType',sa=true,rf='all',go=false,siteFilter='all';
 
 window.addEventListener('DOMContentLoaded',function(){
   document.getElementById('meta-sub').textContent=(META.generatedAt||'')+' | Mode: '+(META.mode||'')+' | Depth: '+(META.scanDepth||'')+' | '+(META.duration||0)+'s'+(META.focusUser?' | Focus: '+META.focusUser:'');
@@ -267,7 +316,7 @@ window.addEventListener('DOMContentLoaded',function(){
     DATA=window.__EMBEDDED__.data;
     if(window.__EMBEDDED__.added)  DIFF_ADDED=window.__EMBEDDED__.added;
     if(window.__EMBEDDED__.removed)DIFF_REMOVED=window.__EMBEDDED__.removed;
-    computeStats();buildOverview();render();buildUsers();buildRisks();if(HAS_COMPARE)buildDiff();
+    computeStats();buildOverview();buildSiteList();render();buildUsers();buildRisks();if(HAS_COMPARE)buildDiff();
     document.getElementById('loading').style.display='none';
     document.getElementById('main-tbl').style.display='';
     return;
@@ -277,7 +326,7 @@ window.addEventListener('DOMContentLoaded',function(){
   fetch(CSV_FILE).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.text();})
   .then(function(txt){
     DATA=parseCSV(txt);
-    computeStats();buildOverview();render();buildUsers();buildRisks();if(HAS_COMPARE)buildDiff();
+    computeStats();buildOverview();buildSiteList();render();buildUsers();buildRisks();if(HAS_COMPARE)buildDiff();
     document.getElementById('loading').style.display='none';
     document.getElementById('main-tbl').style.display='';
   }).catch(function(e){
@@ -311,6 +360,7 @@ function computeStats(){
 function filtered(){
   var q=(document.getElementById('search').value||'').toLowerCase();
   return DATA.filter(function(r){
+    if(siteFilter!=='all'&&r.SiteName!==siteFilter)return false;
     if(tf!=='all'&&r.ObjectType!==tf)return false;
     if(uo&&r.HasUniquePermissions!=='True')return false;
     if(q){var f=[r.ObjectName,r.Principal,r.SiteName,r.PermissionLevel,r.LoginName,r.ObjectUrl],ok=false;for(var i=0;i<f.length;i++)if((f[i]||'').toLowerCase().indexOf(q)!==-1){ok=true;break;}if(!ok)return false;}
@@ -442,6 +492,7 @@ function ptBadge(t,principal){
   if(t==='User')return '<span class="badge b-user">&#128100; User</span>';
   if(t==='SP Group')return '<span class="badge b-sp group-link" onclick="showGroupModal(\'' + (principal||'').replace(/'/g,"\\'") + '\',\'SP Group\')">&#128101; SP Group</span>';
   if(t==='Security Group')return '<span class="badge b-sec group-link" onclick="showGroupModal(\'' + (principal||'').replace(/'/g,"\\'") + '\',\'Security Group\')">&#128101; Sec Group</span>';
+  if(t==='Lien de partage')return '<span class="badge b-share">&#128279; Lien</span>';
   return '<span class="badge b-inh">'+(t||'-')+'</span>';
 }
 function permBadge(l){if(!l||l==='-')return '<span style="color:#94a3b8">-</span>';return '<span class="perm '+lvlClass(l)+'">'+esc(l)+'</span>';}
@@ -533,6 +584,99 @@ function buildOverview(){
   document.getElementById('ov-wrap').innerHTML=h;
 }
 
+function buildSiteList(){
+  var sites={};
+  DATA.forEach(function(r){
+    var s=r.SiteName||'(sans site)';
+    if(!sites[s])sites[s]={count:0,risk:0};
+    sites[s].count++;
+    if(r.Risk&&r.Risk!=='OK')sites[s].risk++;
+  });
+  var names=Object.keys(sites).sort();
+  var h='<div class="ss-item on" onclick="selectSite(\'all\',this)"><span class="ss-name">Tous les sites</span><span class="ss-badge">'+DATA.length+'</span></div>';
+  names.forEach(function(s){
+    var st=sites[s];
+    var dot=st.risk>0?'<span class="ss-dot risk" title="'+st.risk+' risque(s)"></span>':'<span class="ss-dot ok"></span>';
+    h+='<div class="ss-item" onclick="selectSite(\''+s.replace(/'/g,"\\'")+'\',this)" data-site="'+esc(s)+'">'+dot+'<span class="ss-name" title="'+esc(s)+'">'+esc(s)+'</span><span class="ss-badge">'+st.count+'</span></div>';
+  });
+  document.getElementById('ss-list').innerHTML=h;
+}
+function selectSite(site,el){
+  siteFilter=site;
+  document.querySelectorAll('.ss-item').forEach(function(i){i.classList.remove('on');});
+  el.classList.add('on');
+  render();
+}
+function filterSiteList(){
+  var q=(document.getElementById('ss-search').value||'').toLowerCase();
+  document.querySelectorAll('.ss-item[data-site]').forEach(function(i){
+    i.style.display=(!q||i.dataset.site.toLowerCase().indexOf(q)!==-1)?'':'none';
+  });
+}
+
+function exportPDF(){
+  // Construire le resume executif puis declencher l impression (Save as PDF)
+  buildPrintSummary();
+  window.print();
+}
+
+function buildPrintSummary(){
+  var sites={},uniq=0,crit=0,high=0,med=0,ext=0,everyone=0,anyone=0;
+  var siteStats={},userAccess={};
+  DATA.forEach(function(r){
+    sites[r.SiteName]=1;
+    if(!siteStats[r.SiteName])siteStats[r.SiteName]={risk:0,total:0};
+    siteStats[r.SiteName].total++;
+    if(r.HasUniquePermissions==='True')uniq++;
+    var rk=r.Risk||'';
+    if(rk.startsWith('CRITIQUE')){crit++;siteStats[r.SiteName].risk++;}
+    else if(rk.startsWith('ELEVE')){high++;siteStats[r.SiteName].risk++;}
+    else if(rk.startsWith('MOYEN'))med++;
+    if(rk.indexOf('xterne')!==-1)ext++;
+    if(rk.indexOf('Everyone')!==-1)everyone++;
+    if(rk.indexOf('public')!==-1&&rk.indexOf('Lien')!==-1)anyone++;
+    var p=r.Principal;
+    if(p&&p!=='(inherited)'&&p!=='(no assignments)')userAccess[p]=(userAccess[p]||0)+1;
+  });
+  var nSites=Object.keys(sites).length;
+
+  var topSites=Object.keys(siteStats).map(function(s){return {name:s,risk:siteStats[s].risk};})
+    .filter(function(s){return s.risk>0;}).sort(function(a,b){return b.risk-a.risk;}).slice(0,8);
+
+  var h='';
+  h+='<div class="ps-header"><div><div class="ps-title">Rapport de permissions SharePoint</div>';
+  h+='<div class="ps-meta">'+(META.generatedAt||'')+' &middot; Mode: '+(META.mode||'')+' &middot; Profondeur: '+(META.scanDepth||'')+'</div></div>';
+  h+='<div style="font-size:11px;color:#94a3b8;text-align:right">Resume executif<br>Genere automatiquement</div></div>';
+
+  h+='<div class="ps-section"><div class="ps-kpis">';
+  h+='<div class="ps-kpi"><div class="n" style="color:#2563eb">'+nSites+'</div><div class="l">Sites</div></div>';
+  h+='<div class="ps-kpi"><div class="n">'+DATA.length+'</div><div class="l">Permissions</div></div>';
+  h+='<div class="ps-kpi"><div class="n" style="color:#d97706">'+uniq+'</div><div class="l">Uniques</div></div>';
+  h+='<div class="ps-kpi"><div class="n" style="color:#dc2626">'+crit+'</div><div class="l">Critiques</div></div>';
+  h+='<div class="ps-kpi"><div class="n" style="color:#dc2626">'+high+'</div><div class="l">Eleves</div></div>';
+  h+='<div class="ps-kpi"><div class="n" style="color:#d97706">'+med+'</div><div class="l">Moyens</div></div>';
+  h+='</div></div>';
+
+  h+='<div class="ps-section"><h2>Points d attention</h2>';
+  if(anyone>0)h+='<div class="ps-insight">&#128308; <b>'+anyone+'</b> lien(s) de partage public "Anyone" detecte(s) - risque eleve d exposition.</div>';
+  if(everyone>0)h+='<div class="ps-insight">&#128308; <b>'+everyone+'</b> objet(s) accessibles a "Everyone".</div>';
+  if(ext>0)h+='<div class="ps-insight">&#128993; <b>'+ext+'</b> acces accorde(s) a des utilisateurs externes.</div>';
+  if(crit+high===0)h+='<div class="ps-insight">&#9989; Aucun risque critique ou eleve detecte.</div>';
+  h+='<div class="ps-insight">&#128274; <b>'+uniq+'</b> objet(s) ont des permissions uniques (heritage brise).</div>';
+  h+='</div>';
+
+  if(topSites.length){
+    h+='<div class="ps-section"><h2>Sites les plus exposes</h2><table class="ps-table"><tr><th>Site</th><th>Risques</th></tr>';
+    topSites.forEach(function(s){h+='<tr><td>'+esc(s.name)+'</td><td>'+s.risk+'</td></tr>';});
+    h+='</table></div>';
+  }
+
+  h+='<div class="ps-section" style="margin-top:30px;border-top:1px solid #e2e8f0;padding-top:10px;font-size:10px;color:#94a3b8">';
+  h+='Genere par SharePoint Permission Scanner. Document confidentiel.</div>';
+
+  document.getElementById('print-summary').innerHTML=h;
+}
+
 function exportHTML(){
   // Creer un HTML autonome avec les donnees embarquees (pas besoin du CSV)
   var html=document.documentElement.outerHTML;
@@ -600,5 +744,8 @@ document.addEventListener('keydown', function(e) { if (e.key === 'Escape') close
     <div class="modal-body" id="gm-body"></div>
   </div>
 </div>
+
+<!-- RESUME EXECUTIF (visible uniquement a l impression PDF) -->
+<div id="print-summary"></div>
 </body>
 </html>
