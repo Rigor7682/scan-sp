@@ -391,21 +391,43 @@ function Get-GroupMembers {
         foreach ($ra in $SecurableObject.RoleAssignments) {
             Get-PnPProperty -ClientObject $ra -Property Member, RoleDefinitionBindings | Out-Null
             $levels = ($ra.RoleDefinitionBindings | Select-Object -ExpandProperty Name) -join ", "
+            $login = $ra.Member.LoginName
             $type = switch -Wildcard ($ra.Member.PrincipalType.ToString()) {
                 "User"            { "User" }
                 "SharePointGroup" { "SP Group" }
                 "SecurityGroup"   { "Security Group" }
                 default           { $ra.Member.PrincipalType.ToString() }
             }
-            # Charger membres pour les groupes
-            if ($type -in @("SP Group", "Security Group")) {
-                Get-GroupMembers -GroupTitle $ra.Member.Title -LoginName $ra.Member.LoginName -PrincipalType $type
+
+            # Detection des liens de partage (SharingLinks dans le LoginName)
+            $shareType = ''
+            if ($login -match 'SharingLinks') {
+                $type = 'Lien de partage'
+                if ($login -match 'Anonymous|Anonymous') {
+                    if ($login -match 'Edit')     { $shareType = 'Anyone (modification)' }
+                    else                          { $shareType = 'Anyone (lecture)' }
+                } elseif ($login -match 'Organization') {
+                    if ($login -match 'Edit')     { $shareType = 'Organisation (modification)' }
+                    else                          { $shareType = 'Organisation (lecture)' }
+                } elseif ($login -match 'Flexible') {
+                    $shareType = 'Personnes specifiques'
+                } else {
+                    $shareType = 'Lien de partage'
+                }
             }
+
+            # Charger membres pour les groupes (pas pour les liens de partage)
+            if ($type -in @("SP Group", "Security Group")) {
+                Get-GroupMembers -GroupTitle $ra.Member.Title -LoginName $login -PrincipalType $type
+            }
+
+            $principalName = if ($shareType) { $shareType } else { $ra.Member.Title }
             $perms += [PSCustomObject]@{
-                Principal     = $ra.Member.Title
-                LoginName     = $ra.Member.LoginName
+                Principal     = $principalName
+                LoginName     = $login
                 PrincipalType = $type
                 PermLevel     = $levels
+                ShareType     = $shareType
             }
         }
     } catch {
@@ -460,8 +482,20 @@ function Invoke-ScanSite {
 
 # ── Detection des risques ──────────────────────────────────────────────────────
 function Get-RiskLevel {
-    param([string]$Principal, [string]$LoginName, [string]$PermLevel, [string]$PrincipalType)
+    param([string]$Principal, [string]$LoginName, [string]$PermLevel, [string]$PrincipalType, [string]$ShareType = '')
     $risks = @()
+
+    # Liens de partage - les "Anyone" sont les plus dangereux
+    if ($ShareType) {
+        if ($ShareType -like 'Anyone*') {
+            $risks += "CRITIQUE: Lien de partage public ($ShareType)"
+        } elseif ($ShareType -like 'Organisation*modification*') {
+            $risks += "ELEVE: Lien organisation en modification"
+        } elseif ($ShareType -like 'Organisation*') {
+            $risks += "MOYEN: Lien de partage organisation ($ShareType)"
+        }
+    }
+
     if ($LoginName -match 'spo-grid-all-users|everyone except external|c:0\(.s\|true' -or
         $Principal -match '^Everyone|^All Users|^Tout le monde') {
         $risks += 'CRITIQUE: Acces public (Everyone)'
@@ -489,8 +523,9 @@ function Export-CsvReport {
     foreach ($r in $Script:ScanResults) {
         if ($r.Permissions -and $r.Permissions.Count -gt 0) {
             foreach ($p in $r.Permissions) {
+                $shareType = if ($p.PSObject.Properties['ShareType']) { $p.ShareType } else { '' }
                 $risk = Get-RiskLevel -Principal $p.Principal -LoginName $p.LoginName `
-                    -PermLevel $p.PermLevel -PrincipalType $p.PrincipalType
+                    -PermLevel $p.PermLevel -PrincipalType $p.PrincipalType -ShareType $shareType
                 $rows.Add([PSCustomObject]@{
                     SiteName             = $r.SiteName
                     SiteUrl              = $r.SiteUrl
@@ -503,6 +538,7 @@ function Export-CsvReport {
                     LoginName            = $p.LoginName
                     PrincipalType        = $p.PrincipalType
                     PermissionLevel      = $p.PermLevel
+                    ShareType            = $shareType
                     Risk                 = $risk
                     ScannedAt            = $r.ScannedAt
                 })
@@ -520,6 +556,7 @@ function Export-CsvReport {
                 LoginName            = ""
                 PrincipalType        = ""
                 PermissionLevel      = $(if ($r.HasUniquePermissions) { "(no assignments)" } else { "(inherited)" })
+                ShareType            = ""
                 Risk                 = "OK"
                 ScannedAt            = $r.ScannedAt
             })
