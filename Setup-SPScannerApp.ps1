@@ -388,28 +388,31 @@ function New-AppRegistration {
             resourceAppId  = $spAppId
             resourceAccess = @($spRoles | ForEach-Object { @{ id = $_; type = "Role" } })
         }
-        # Graph : User.Read.All + Group.Read.All
+        # Graph : User.Read.All + Group.Read.All + GroupMember.Read.All (membres des groupes AAD)
         $graphRoles = @(
             (Get-AppRoleId -ServicePrincipal $graphServicePrincipal -RoleName "User.Read.All"),
-            (Get-AppRoleId -ServicePrincipal $graphServicePrincipal -RoleName "Group.Read.All")
+            (Get-AppRoleId -ServicePrincipal $graphServicePrincipal -RoleName "Group.Read.All"),
+            (Get-AppRoleId -ServicePrincipal $graphServicePrincipal -RoleName "GroupMember.Read.All")
         )
         $requiredResourceAccess += @{
             resourceAppId  = $graphAppId
             resourceAccess = @($graphRoles | ForEach-Object { @{ id = $_; type = "Role" } })
         }
-        Write-Ok "Permissions AllSites : Sites.FullControl.All, TermStore.Read.All, User.Read.All, Group.Read.All"
+        Write-Ok "Permissions AllSites : Sites.FullControl.All, TermStore.Read.All, User.Read.All, Group.Read.All, GroupMember.Read.All"
     } else {
         # Graph : Sites.Selected (granulaire par site) + User.Read.All
         # IMPORTANT: Sites.Selected est une permission GRAPH, pas SharePoint
         $graphRoles = @(
             (Get-AppRoleId -ServicePrincipal $graphServicePrincipal -RoleName "Sites.Selected"),
-            (Get-AppRoleId -ServicePrincipal $graphServicePrincipal -RoleName "User.Read.All")
+            (Get-AppRoleId -ServicePrincipal $graphServicePrincipal -RoleName "User.Read.All"),
+            (Get-AppRoleId -ServicePrincipal $graphServicePrincipal -RoleName "Group.Read.All"),
+            (Get-AppRoleId -ServicePrincipal $graphServicePrincipal -RoleName "GroupMember.Read.All")
         )
         $requiredResourceAccess += @{
             resourceAppId  = $graphAppId
             resourceAccess = @($graphRoles | ForEach-Object { @{ id = $_; type = "Role" } })
         }
-        Write-Ok "Permissions SingleSite/MultipleSites : Sites.Selected (Graph), User.Read.All"
+        Write-Ok "Permissions SingleSite/MultipleSites : Sites.Selected, User.Read.All, Group.Read.All, GroupMember.Read.All"
         Write-Warn "Sites.Selected ne donne aucun acces par defaut - vous devrez accorder l acces par site apres le setup (etape 6)"
     }
 
