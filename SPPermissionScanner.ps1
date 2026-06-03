@@ -124,6 +124,7 @@ $ErrorActionPreference = "Stop"
 $Script:ScanResults   = [System.Collections.Generic.List[PSCustomObject]]::new()
 $Script:ScanErrors    = [System.Collections.Generic.List[PSCustomObject]]::new()
 $Script:TotalScanned  = 0
+$Script:GroupMembers  = [System.Collections.Generic.Dictionary[string,object]]::new()
 $Script:StartTime     = Get-Date
 $Script:SystemLists   = @(
     "appdata", "appfiles", "composed looks", "converted forms",
@@ -367,6 +368,22 @@ function Invoke-ScanList {
 
 function Get-SPPermissions {
     # Extrait les permissions d un objet SharePoint via Get-PnPProperty (charge les sous-objets)
+
+function Get-GroupMembers {
+    param([string]$GroupTitle, [string]$LoginName, [string]$PrincipalType)
+    if ($Script:GroupMembers.ContainsKey($GroupTitle)) { return }
+    $members = @()
+    try {
+        if ($PrincipalType -eq "SP Group") {
+            $pnpMembers = Get-PnPGroupMember -Identity $GroupTitle -ErrorAction SilentlyContinue
+            foreach ($m in $pnpMembers) {
+                $members += [PSCustomObject]@{ name=$m.Title; email=$m.Email; login=$m.LoginName; type="User" }
+            }
+        }
+    } catch { }
+    $Script:GroupMembers[$GroupTitle] = $members
+}
+
     param([object]$SecurableObject)
     $perms = @()
     try {
@@ -374,17 +391,43 @@ function Get-SPPermissions {
         foreach ($ra in $SecurableObject.RoleAssignments) {
             Get-PnPProperty -ClientObject $ra -Property Member, RoleDefinitionBindings | Out-Null
             $levels = ($ra.RoleDefinitionBindings | Select-Object -ExpandProperty Name) -join ", "
+            $login = $ra.Member.LoginName
             $type = switch -Wildcard ($ra.Member.PrincipalType.ToString()) {
                 "User"            { "User" }
                 "SharePointGroup" { "SP Group" }
                 "SecurityGroup"   { "Security Group" }
                 default           { $ra.Member.PrincipalType.ToString() }
             }
+
+            # Detection des liens de partage (SharingLinks dans le LoginName)
+            $shareType = ''
+            if ($login -match 'SharingLinks') {
+                $type = 'Lien de partage'
+                if ($login -match 'Anonymous|Anonymous') {
+                    if ($login -match 'Edit')     { $shareType = 'Anyone (modification)' }
+                    else                          { $shareType = 'Anyone (lecture)' }
+                } elseif ($login -match 'Organization') {
+                    if ($login -match 'Edit')     { $shareType = 'Organisation (modification)' }
+                    else                          { $shareType = 'Organisation (lecture)' }
+                } elseif ($login -match 'Flexible') {
+                    $shareType = 'Personnes specifiques'
+                } else {
+                    $shareType = 'Lien de partage'
+                }
+            }
+
+            # Charger membres pour les groupes (pas pour les liens de partage)
+            if ($type -in @("SP Group", "Security Group")) {
+                Get-GroupMembers -GroupTitle $ra.Member.Title -LoginName $login -PrincipalType $type
+            }
+
+            $principalName = if ($shareType) { $shareType } else { $ra.Member.Title }
             $perms += [PSCustomObject]@{
-                Principal     = $ra.Member.Title
-                LoginName     = $ra.Member.LoginName
+                Principal     = $principalName
+                LoginName     = $login
                 PrincipalType = $type
                 PermLevel     = $levels
+                ShareType     = $shareType
             }
         }
     } catch {
@@ -439,8 +482,20 @@ function Invoke-ScanSite {
 
 # ── Detection des risques ──────────────────────────────────────────────────────
 function Get-RiskLevel {
-    param([string]$Principal, [string]$LoginName, [string]$PermLevel, [string]$PrincipalType)
+    param([string]$Principal, [string]$LoginName, [string]$PermLevel, [string]$PrincipalType, [string]$ShareType = '')
     $risks = @()
+
+    # Liens de partage - les "Anyone" sont les plus dangereux
+    if ($ShareType) {
+        if ($ShareType -like 'Anyone*') {
+            $risks += "CRITIQUE: Lien de partage public ($ShareType)"
+        } elseif ($ShareType -like 'Organisation*modification*') {
+            $risks += "ELEVE: Lien organisation en modification"
+        } elseif ($ShareType -like 'Organisation*') {
+            $risks += "MOYEN: Lien de partage organisation ($ShareType)"
+        }
+    }
+
     if ($LoginName -match 'spo-grid-all-users|everyone except external|c:0\(.s\|true' -or
         $Principal -match '^Everyone|^All Users|^Tout le monde') {
         $risks += 'CRITIQUE: Acces public (Everyone)'
@@ -468,8 +523,9 @@ function Export-CsvReport {
     foreach ($r in $Script:ScanResults) {
         if ($r.Permissions -and $r.Permissions.Count -gt 0) {
             foreach ($p in $r.Permissions) {
+                $shareType = if ($p.PSObject.Properties['ShareType']) { $p.ShareType } else { '' }
                 $risk = Get-RiskLevel -Principal $p.Principal -LoginName $p.LoginName `
-                    -PermLevel $p.PermLevel -PrincipalType $p.PrincipalType
+                    -PermLevel $p.PermLevel -PrincipalType $p.PrincipalType -ShareType $shareType
                 $rows.Add([PSCustomObject]@{
                     SiteName             = $r.SiteName
                     SiteUrl              = $r.SiteUrl
@@ -482,6 +538,7 @@ function Export-CsvReport {
                     LoginName            = $p.LoginName
                     PrincipalType        = $p.PrincipalType
                     PermissionLevel      = $p.PermLevel
+                    ShareType            = $shareType
                     Risk                 = $risk
                     ScannedAt            = $r.ScannedAt
                 })
@@ -499,16 +556,47 @@ function Export-CsvReport {
                 LoginName            = ""
                 PrincipalType        = ""
                 PermissionLevel      = $(if ($r.HasUniquePermissions) { "(no assignments)" } else { "(inherited)" })
+                ShareType            = ""
                 Risk                 = "OK"
                 ScannedAt            = $r.ScannedAt
             })
         }
     }
     if ($FocusUser) {
-        $rows = [System.Collections.Generic.List[PSCustomObject]]($rows | Where-Object {
-            $_.Principal -like "*$FocusUser*" -or $_.LoginName -like "*$FocusUser*"
-        })
-        Write-Log "FocusUser '$FocusUser' : $($rows.Count) lignes" -Level INFO
+        # 1. Trouver tous les groupes dont l utilisateur est membre (lookup inverse)
+        $userGroups = [System.Collections.Generic.List[string]]::new()
+        foreach ($groupName in $Script:GroupMembers.Keys) {
+            $members = $Script:GroupMembers[$groupName]
+            foreach ($m in $members) {
+                if (($m.email -and $m.email -like "*$FocusUser*") -or
+                    ($m.name  -and $m.name  -like "*$FocusUser*") -or
+                    ($m.login -and $m.login -like "*$FocusUser*")) {
+                    if (-not $userGroups.Contains($groupName)) { $userGroups.Add($groupName) }
+                    break
+                }
+            }
+        }
+        if ($userGroups.Count -gt 0) {
+            Write-Log "FocusUser '$FocusUser' membre de $($userGroups.Count) groupe(s) : $($userGroups -join ', ')" -Level INFO
+        }
+
+        # 2. Filtrer : acces direct OU via un groupe dont l utilisateur est membre
+        $filtered = [System.Collections.Generic.List[PSCustomObject]]::new()
+        foreach ($r in $rows) {
+            $isDirect = ($r.Principal -like "*$FocusUser*" -or $r.LoginName -like "*$FocusUser*")
+            $viaGroup = $null
+            foreach ($g in $userGroups) {
+                if ($r.Principal -eq $g) { $viaGroup = $g; break }
+            }
+            if ($isDirect -or $viaGroup) {
+                # Ajouter une colonne AccessVia pour indiquer comment l acces est accorde
+                $r | Add-Member -NotePropertyName 'AccessVia' `
+                    -NotePropertyValue $(if ($isDirect) { 'Direct' } else { "Groupe: $viaGroup" }) -Force
+                $filtered.Add($r)
+            }
+        }
+        $rows = $filtered
+        Write-Log "FocusUser '$FocusUser' : $($rows.Count) lignes (direct + via groupes)" -Level INFO
     }
     $rows | Export-Csv -Path $CsvPath -Encoding UTF8 -NoTypeInformation -Force
     Write-Log "CSV : $CsvPath ($($rows.Count) lignes)" -Level OK
@@ -596,14 +684,23 @@ function New-HtmlReport {
         duration    = $scanDuration
         errors      = $errorCount
         totalRows   = $rows.Count
+        focusUser   = $FocusUser
     } | ConvertTo-Json -Compress
 
+    # Serialiser les membres de groupes
+    $groupMembersJson = if ($Script:GroupMembers.Count -gt 0) {
+        $gmObj = @{}
+        foreach ($key in $Script:GroupMembers.Keys) { $gmObj[$key] = $Script:GroupMembers[$key] }
+        $gmObj | ConvertTo-Json -Compress -Depth 4
+    } else { '{}' }
+
     $html = [System.IO.File]::ReadAllText($templatePath, [System.Text.Encoding]::UTF8)
-    $html = $html.Replace('__CSV_FILENAME__',  $csvFileName)
-    $html = $html.Replace('__META_JSON__',     $metaJson)
-    $html = $html.Replace('__DIFF_ADDED__',    $addedJson)
-    $html = $html.Replace('__DIFF_REMOVED__',  $removedJson)
-    $html = $html.Replace('__HAS_COMPARE__',   $hasCompare)
+    $html = $html.Replace('__CSV_FILENAME__',   $csvFileName)
+    $html = $html.Replace('__META_JSON__',      $metaJson)
+    $html = $html.Replace('__DIFF_ADDED__',     $addedJson)
+    $html = $html.Replace('__DIFF_REMOVED__',   $removedJson)
+    $html = $html.Replace('__HAS_COMPARE__',    $hasCompare)
+    $html = $html.Replace('__GROUP_MEMBERS__',  $groupMembersJson)
 
     [System.IO.File]::WriteAllText($OutputPath, $html, [System.Text.Encoding]::UTF8)
     Write-Log "HTML : $OutputPath" -Level OK
