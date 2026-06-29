@@ -231,9 +231,16 @@ function New-ScannerCertificate {
     Write-Step -Num 3 -Total 7 -Title "Génération du certificat"
 
     $certFolder = $Info.CertPath
+    # Resoudre en chemin absolu (evite la resolution contre C:\WINDOWS\system32 en mode admin)
+    if (-not [System.IO.Path]::IsPathRooted($certFolder)) {
+        $certFolder = Join-Path $env:USERPROFILE $certFolder
+        Write-Warn "Chemin relatif detecte - utilisation de : $certFolder"
+    }
     if (-not (Test-Path $certFolder)) {
         New-Item -ItemType Directory -Path $certFolder -Force | Out-Null
     }
+    # Normaliser en chemin absolu complet
+    $certFolder = (Resolve-Path $certFolder).Path
 
     $certName    = $Info.AppName -replace "\s+", "_"
     $pfxPath     = Join-Path $certFolder "$certName.pfx"
@@ -422,6 +429,9 @@ function New-AppRegistration {
 
     if ($Info.AuthMethod -eq "Certificate") {
         Write-Info "Lecture du certificat public..."
+        if (-not (Test-Path $Info.CerPath)) {
+            throw "Certificat introuvable : $($Info.CerPath). La generation du certificat a peut-etre echoue. Relancez le setup."
+        }
         $certBytes = [System.IO.File]::ReadAllBytes($Info.CerPath)
         $cert      = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($Info.CerPath)
         $keyCredentials = @(@{

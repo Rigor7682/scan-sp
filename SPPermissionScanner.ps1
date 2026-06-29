@@ -111,9 +111,13 @@ param(
     # Ex: -FocusUser "john.doe@contoso.com"
 
     [Parameter()]
-    [string]$CompareWith
+    [string]$CompareWith,
     # CSV d un scan precedent pour comparaison avant/apres
     # Ex: -CompareWith ".\SPPermissions_20260501.csv"
+
+    [Parameter()]
+    [switch]$IncludeOneDrive
+    # Inclure les sites OneDrive personnels (mode AllSites uniquement)
 )
 
 Set-StrictMode -Version Latest
@@ -366,9 +370,6 @@ function Invoke-ScanList {
     }
 }
 
-function Get-SPPermissions {
-    # Extrait les permissions d un objet SharePoint via Get-PnPProperty (charge les sous-objets)
-
 function Get-GroupMembers {
     param([string]$GroupTitle, [string]$LoginName, [string]$PrincipalType)
     if ($Script:GroupMembers.ContainsKey($GroupTitle)) { return }
@@ -384,7 +385,10 @@ function Get-GroupMembers {
     $Script:GroupMembers[$GroupTitle] = $members
 }
 
+function Get-SPPermissions {
+    # Extrait les permissions d un objet SharePoint via Get-PnPProperty (charge les sous-objets)
     param([object]$SecurableObject)
+    if (-not $SecurableObject) { return @() }
     $perms = @()
     try {
         Get-PnPProperty -ClientObject $SecurableObject -Property HasUniqueRoleAssignments, RoleAssignments | Out-Null
@@ -702,6 +706,32 @@ function New-HtmlReport {
     $html = $html.Replace('__HAS_COMPARE__',    $hasCompare)
     $html = $html.Replace('__GROUP_MEMBERS__',  $groupMembersJson)
 
+    # Embarquer les donnees directement dans le HTML pour qu il fonctionne aussi
+    # en double-clic (file://) sans dependre du fetch CSV bloque par CORS.
+    $dataJson = if ($rows.Count -gt 0) {
+        $rows | ConvertTo-Json -Compress -Depth 3
+    } else { '[]' }
+    # ConvertTo-Json sur un seul element ne produit pas un tableau - forcer les crochets
+    if ($rows.Count -eq 1) { $dataJson = "[$dataJson]" }
+
+    # SECURITE : echapper "<" en "\u003c" pour eviter qu un "</script>" present dans
+    # les donnees (nom de fichier, URL...) ne ferme le bloc script prematurement.
+    # JavaScript redecode \u003c en "<", donc les donnees restent correctes.
+    $escLt = { param($s) if ($s) { $s.Replace('<', '\u003c') } else { $s } }
+    $dataJson    = & $escLt $dataJson
+    $metaEsc     = & $escLt $metaJson
+    $addedEsc    = & $escLt $addedJson
+    $removedEsc  = & $escLt $removedJson
+
+    $embedScript = "<script>window.__EMBEDDED__={data:$dataJson,meta:$metaEsc,added:$addedEsc,removed:$removedEsc};</script>"
+    # Injecter avant le PREMIER </head> uniquement
+    $headIdx = $html.IndexOf('</head>')
+    if ($headIdx -ge 0) {
+        $html = $html.Substring(0, $headIdx) + $embedScript + $html.Substring($headIdx)
+    } else {
+        Write-Log "Balise </head> introuvable dans le template" -Level WARN
+    }
+
     [System.IO.File]::WriteAllText($OutputPath, $html, [System.Text.Encoding]::UTF8)
     Write-Log "HTML : $OutputPath" -Level OK
     Write-Log "CSV  : $csvPath"    -Level OK
@@ -800,7 +830,20 @@ try {
         "AllSites" {
             if (-not $TenantAdminUrl) { throw "TenantAdminUrl is required for AllSites mode." }
             Connect-ToSite -Url $TenantAdminUrl
-            $allSites = Get-PnPTenantSite -IncludeOneDriveSites:$false | Select-Object -ExpandProperty Url
+            $allSites = Get-PnPTenantSite -IncludeOneDriveSites:$IncludeOneDrive | Select-Object -ExpandProperty Url
+
+            if ($IncludeOneDrive) {
+                Write-Log "OneDrive personnels INCLUS dans le scan" -Level INFO
+            } else {
+                # Double securite : filtrer explicitement les URL OneDrive
+                # (Get-PnPTenantSite peut retourner des sites -my.sharepoint.com malgre le switch)
+                $beforeCount = $allSites.Count
+                $allSites = $allSites | Where-Object {
+                    $_ -notmatch '-my\.sharepoint\.com' -and $_ -notmatch '/personal/'
+                }
+                $excluded = $beforeCount - $allSites.Count
+                Write-Log "OneDrive personnels EXCLUS : $excluded site(s) filtre(s) (utilisez -IncludeOneDrive `$true pour les inclure)" -Level INFO
+            }
             Disconnect-PnPOnline
             Write-Log "Found $($allSites.Count) sites to scan." -Level OK
             foreach ($siteUrl in $allSites) { Invoke-ScanSite -Url $siteUrl }

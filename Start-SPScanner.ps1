@@ -154,6 +154,13 @@ a{color:#60a5fa;text-decoration:none}a:hover{text-decoration:underline}
             <input class="fi" id="fcmp" type="text" placeholder="SPPermissions_20260501.csv">
             <div class="fh">Nom du CSV d un scan precedent</div></div>
         </div>
+        <div class="fr" id="onedrive-row" style="display:none">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;text-transform:none;font-weight:400">
+            <input type="checkbox" id="fonedrive" style="width:16px;height:16px;cursor:pointer">
+            <span style="font-size:13px;color:#e2e8f0">Inclure les OneDrive personnels des utilisateurs</span>
+          </label>
+          <div class="fh">Augmente fortement la duree du scan (un site par utilisateur)</div>
+        </div>
         <div style="display:flex;gap:8px;align-items:center">
           <button class="btn bp" id="bs" onclick="startScan()">&#9654; Lancer le scan</button>
           <button class="btn bd" id="bst" style="display:none" onclick="stopScan()">&#9632; Arreter</button>
@@ -198,13 +205,14 @@ function onMC(){
   var m=document.getElementById('fm').value;
   document.getElementById('url-row').style.display=(m==='AllSites')?'none':'';
   document.getElementById('admin-row').style.display=(m==='AllSites')?'':'none';
+  document.getElementById('onedrive-row').style.display=(m==='AllSites')?'':'none';
 }
 function startScan(){
-  var mode=document.getElementById('fm').value,url=document.getElementById('fu').value.trim(),depth=document.getElementById('fd').value,user=document.getElementById('fuser').value.trim(),cmp=document.getElementById('fcmp').value.trim();
+  var mode=document.getElementById('fm').value,url=document.getElementById('fu').value.trim(),depth=document.getElementById('fd').value,user=document.getElementById('fuser').value.trim(),cmp=document.getElementById('fcmp').value.trim(),onedrive=document.getElementById('fonedrive').checked;
   if(mode!=='AllSites'&&!url){alert('URL du site requise.');return;}
   clearLog();addLog('Demarrage du scan...','se');
   setStatus('r');document.getElementById('bs').disabled=true;document.getElementById('bst').style.display='';document.getElementById('pw').style.display='';
-  fetch('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode,siteUrl:url,tenantAdminUrl:document.getElementById('fadmin').value.trim(),scanDepth:depth,focusUser:user,compareWith:cmp})})
+  fetch('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode,siteUrl:url,tenantAdminUrl:document.getElementById('fadmin').value.trim(),scanDepth:depth,focusUser:user,compareWith:cmp,includeOneDrive:onedrive})})
     .then(function(r){return r.json();})
     .then(function(d){if(d.error){addLog('Erreur: '+d.error,'er');resetBtn();return;}addLog('Scan demarre - PID: '+d.pid,'ok');pollT=setInterval(poll,1200);})
     .catch(function(e){addLog('Erreur: '+e,'er');resetBtn();});
@@ -255,10 +263,22 @@ function Send-File {
     param($Res, [string]$Path)
     $ext  = [IO.Path]::GetExtension($Path).ToLower()
     $mime = switch ($ext) { '.html' { 'text/html; charset=utf-8' } '.csv' { 'text/csv; charset=utf-8' } '.json' { 'application/json' } default { 'application/octet-stream' } }
-    $bytes = [IO.File]::ReadAllBytes($Path)
-    $Res.ContentType     = $mime
-    $Res.ContentLength64 = $bytes.Length
-    $Res.OutputStream.Write($bytes, 0, $bytes.Length)
+    try {
+        # Lecture avec FileShare.ReadWrite pour eviter les erreurs de verrouillage
+        $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try {
+            $Res.ContentType     = $mime
+            $Res.ContentLength64 = $fs.Length
+            $fs.CopyTo($Res.OutputStream)
+        } finally {
+            $fs.Close()
+        }
+    } catch {
+        Write-Host "Erreur Send-File ($Path) : $_" -ForegroundColor Red
+        $Res.StatusCode = 500
+        $msg = [Text.Encoding]::UTF8.GetBytes("Erreur lecture fichier: $_")
+        try { $Res.ContentLength64 = $msg.Length; $Res.OutputStream.Write($msg, 0, $msg.Length) } catch {}
+    }
 }
 
 function Start-ScanProcess {
@@ -307,6 +327,9 @@ function Start-ScanProcess {
     if ($Params.compareWith -and $Params.compareWith -ne '') {
         $cmpPath = Join-Path $ScanDir $Params.compareWith
         if (Test-Path $cmpPath) { $argList.Add('-CompareWith'); $argList.Add("`"$cmpPath`"") }
+    }
+    if ($Params.PSObject.Properties['includeOneDrive'] -and $Params.includeOneDrive) {
+        $argList.Add('-IncludeOneDrive')
     }
 
     # Utiliser Start-Process avec redirection native (pas d events .NET)
