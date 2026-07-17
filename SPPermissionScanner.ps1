@@ -116,8 +116,16 @@ param(
     # Ex: -CompareWith ".\SPPermissions_20260501.csv"
 
     [Parameter()]
-    [switch]$IncludeOneDrive
+    [switch]$IncludeOneDrive,
     # Inclure les sites OneDrive personnels (mode AllSites uniquement)
+
+    [Parameter()]
+    [switch]$Resume,
+    # Reprendre un scan interrompu (mode AllSites) depuis le dernier checkpoint
+
+    [Parameter()]
+    [int]$MaxRetries = 5
+    # Nombre de tentatives en cas de throttling SharePoint (429)
 )
 
 Set-StrictMode -Version Latest
@@ -130,6 +138,13 @@ $Script:ScanErrors    = [System.Collections.Generic.List[PSCustomObject]]::new()
 $Script:TotalScanned  = 0
 $Script:GroupMembers  = [System.Collections.Generic.Dictionary[string,object]]::new()
 $Script:StartTime     = Get-Date
+
+# ── Resilience (gros scans) ──
+$Script:CsvStreamPath   = $null   # CSV ecrit au fil de l eau
+$Script:CsvHeaderWritten= $false  # En-tete CSV deja ecrit ?
+$Script:CheckpointPath  = $null   # Liste des sites deja scannes
+$Script:CompletedSites  = [System.Collections.Generic.HashSet[string]]::new()
+$Script:LastReconnect   = Get-Date # Pour reconnexion periodique du token
 $Script:SystemLists   = @(
     "appdata", "appfiles", "composed looks", "converted forms",
     "form templates", "list template gallery", "master page gallery",
@@ -230,10 +245,126 @@ function Connect-ToSite {
             Connect-PnPOnline -Url $Url -Interactive -ErrorAction Stop
         }
         Write-Log "Connected successfully." -Level OK
+        $Script:LastReconnect = Get-Date
     } catch {
         Write-Log "Connection failed: $_" -Level ERROR
         throw
     }
+}
+
+#endregion
+
+#region ──────────────────────── RESILIENCE (gros scans) ────────────────────────
+
+function Invoke-WithRetry {
+    <#
+        Execute un scriptblock avec gestion du throttling SharePoint (429 / 503).
+        Respecte l en-tete Retry-After si present, sinon backoff exponentiel.
+    #>
+    param(
+        [scriptblock]$Action,
+        [string]$Context = "operation"
+    )
+    $attempt = 0
+    while ($true) {
+        try {
+            return & $Action
+        } catch {
+            $attempt++
+            $msg = $_.Exception.Message
+            $isThrottle = $msg -match '429|throttl|too many requests|503|Service Unavailable|temporarily'
+
+            if (-not $isThrottle -or $attempt -ge $MaxRetries) {
+                throw   # Erreur non-throttling OU trop de tentatives -> remonter
+            }
+
+            # Chercher un Retry-After dans l exception
+            $wait = 0
+            if ($_.Exception.Response -and $_.Exception.Response.Headers) {
+                try {
+                    $ra = $_.Exception.Response.Headers['Retry-After']
+                    if ($ra) { $wait = [int]$ra }
+                } catch {}
+            }
+            if ($wait -le 0) { $wait = [math]::Min(60, [math]::Pow(2, $attempt)) }  # backoff expo, max 60s
+
+            Write-Log "Throttling detecte sur $Context (tentative $attempt/$MaxRetries) - pause ${wait}s" -Level WARN
+            Start-Sleep -Seconds $wait
+        }
+    }
+}
+
+function Test-TokenRefresh {
+    <#
+        Reconnecte si le token approche de l expiration (>45 min depuis derniere connexion).
+        Les tokens app-only SharePoint expirent generalement apres 1h.
+    #>
+    param([string]$Url)
+    $elapsed = (Get-Date) - $Script:LastReconnect
+    if ($elapsed.TotalMinutes -ge 45) {
+        Write-Log "Reconnexion preventive du token (>45min)..." -Level INFO
+        try {
+            Connect-ToSite -Url $Url
+        } catch {
+            Write-Log "Reconnexion echouee, poursuite avec le token actuel : $_" -Level WARN
+        }
+    }
+}
+
+function Initialize-IncrementalSave {
+    <#
+        Prepare le CSV en ecriture au fil de l eau + le fichier checkpoint.
+        En mode -Resume, charge la liste des sites deja scannes.
+    #>
+    param([string]$CsvPath)
+    $Script:CsvStreamPath  = $CsvPath
+    $Script:CheckpointPath = $CsvPath -replace '\.csv$', '.checkpoint'
+
+    if ($Resume -and (Test-Path $Script:CheckpointPath)) {
+        $done = Get-Content $Script:CheckpointPath -ErrorAction SilentlyContinue
+        foreach ($s in $done) { if ($s.Trim()) { [void]$Script:CompletedSites.Add($s.Trim()) } }
+        Write-Log "Reprise : $($Script:CompletedSites.Count) site(s) deja scanne(s) seront ignores" -Level INFO
+
+        # Si le CSV existe deja, on garde son contenu (header deja ecrit)
+        if (Test-Path $Script:CsvStreamPath) {
+            $Script:CsvHeaderWritten = $true
+            Write-Log "CSV existant conserve, ajout en mode append" -Level INFO
+        }
+    } else {
+        # Nouveau scan : repartir de zero
+        if (Test-Path $Script:CsvStreamPath)  { Remove-Item $Script:CsvStreamPath  -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $Script:CheckpointPath) { Remove-Item $Script:CheckpointPath -Force -ErrorAction SilentlyContinue }
+        $Script:CsvHeaderWritten = $false
+    }
+}
+
+function Save-SiteResults {
+    <#
+        Ecrit les resultats accumules pour un site dans le CSV (append) puis
+        marque le site comme termine dans le checkpoint. Vide ensuite la memoire.
+    #>
+    param([string]$SiteUrl)
+
+    if (-not $Script:CsvStreamPath) { return }
+
+    # Convertir les resultats en lignes plates (meme logique que Export-CsvReport)
+    $flatRows = ConvertTo-FlatRows -Results $Script:ScanResults
+
+    if ($flatRows.Count -gt 0) {
+        if (-not $Script:CsvHeaderWritten) {
+            $flatRows | Export-Csv -Path $Script:CsvStreamPath -Encoding UTF8 -NoTypeInformation -Force
+            $Script:CsvHeaderWritten = $true
+        } else {
+            $flatRows | Export-Csv -Path $Script:CsvStreamPath -Encoding UTF8 -NoTypeInformation -Append
+        }
+    }
+
+    # Marquer le site comme termine
+    Add-Content -Path $Script:CheckpointPath -Value $SiteUrl -Encoding UTF8
+    [void]$Script:CompletedSites.Add($SiteUrl)
+
+    # Liberer la memoire : on a deja persiste ces resultats
+    $Script:ScanResults.Clear()
 }
 
 #endregion
@@ -520,11 +651,11 @@ function Get-RiskLevel {
     return ($risks -join ' | ')
 }
 
-# ── Export CSV ─────────────────────────────────────────────────────────────────
-function Export-CsvReport {
-    param([string]$CsvPath)
+# ── Aplatir les resultats en lignes CSV (reutilisable pour save incremental) ──
+function ConvertTo-FlatRows {
+    param([System.Collections.Generic.List[PSCustomObject]]$Results)
     $rows = [System.Collections.Generic.List[PSCustomObject]]::new()
-    foreach ($r in $Script:ScanResults) {
+    foreach ($r in $Results) {
         if ($r.Permissions -and $r.Permissions.Count -gt 0) {
             foreach ($p in $r.Permissions) {
                 $shareType = if ($p.PSObject.Properties['ShareType']) { $p.ShareType } else { '' }
@@ -566,6 +697,22 @@ function Export-CsvReport {
             })
         }
     }
+    return $rows
+}
+
+# ── Export CSV ─────────────────────────────────────────────────────────────────
+function Export-CsvReport {
+    param([string]$CsvPath)
+
+    # En mode incremental, le CSV est deja ecrit au fil de l eau - on le relit pour
+    # appliquer FocusUser et retourner les lignes au generateur HTML.
+    if ($Script:CsvStreamPath -and (Test-Path $Script:CsvStreamPath)) {
+        $rows = [System.Collections.Generic.List[PSCustomObject]](Import-Csv $Script:CsvStreamPath)
+        Write-Log "Lecture du CSV incremental : $($rows.Count) lignes" -Level INFO
+    } else {
+        $rows = ConvertTo-FlatRows -Results $Script:ScanResults
+    }
+
     if ($FocusUser) {
         # 1. Trouver tous les groupes dont l utilisateur est membre (lookup inverse)
         $userGroups = [System.Collections.Generic.List[string]]::new()
@@ -633,14 +780,16 @@ function New-HtmlReport {
 
     $scanDuration = [math]::Round(((Get-Date) - $Script:StartTime).TotalSeconds, 1)
     $genDate      = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $uniqueCount  = @($Script:ScanResults | Where-Object { $_.HasUniquePermissions }).Count
-    $siteCount    = @($Script:ScanResults | Where-Object { $_.ObjectType -eq "Site" }).Count
     $errorCount   = $Script:ScanErrors.Count
     $csvPath      = $OutputPath -replace '\.html$', '.csv'
     $csvFileName  = [System.IO.Path]::GetFileName($csvPath)
 
-    # 1. Exporter le CSV
+    # 1. Exporter le CSV (lit le CSV incremental si present)
     $rows = Export-CsvReport -CsvPath $csvPath
+
+    # Stats calculees depuis les lignes finales (compatible mode incremental)
+    $uniqueCount  = @($rows | Where-Object { $_.HasUniquePermissions -eq $true -or $_.HasUniquePermissions -eq 'True' }).Count
+    $siteCount    = @($rows | Where-Object { $_.ObjectType -eq "Site" }).Count
 
     # 2. Comparaison diff
     $addedJson   = '[]'
@@ -845,13 +994,59 @@ try {
                 Write-Log "OneDrive personnels EXCLUS : $excluded site(s) filtre(s) (utilisez -IncludeOneDrive `$true pour les inclure)" -Level INFO
             }
             Disconnect-PnPOnline
-            Write-Log "Found $($allSites.Count) sites to scan." -Level OK
-            foreach ($siteUrl in $allSites) { Invoke-ScanSite -Url $siteUrl }
+
+            # ── RESILIENCE : sauvegarde incrementale + checkpoint ──
+            $csvPathForSave = $OutputPath -replace '\.html$', '.csv'
+            Initialize-IncrementalSave -CsvPath $csvPathForSave
+
+            # Filtrer les sites deja scannes (mode -Resume)
+            $toScan = @($allSites | Where-Object { -not $Script:CompletedSites.Contains($_) })
+            $totalSites = $toScan.Count
+            $skipped    = $allSites.Count - $totalSites
+            if ($skipped -gt 0) {
+                Write-Log "Reprise : $skipped site(s) deja scanne(s) ignores, $totalSites restant(s)" -Level OK
+            }
+            Write-Log "Found $($allSites.Count) sites ($totalSites a scanner)." -Level OK
+
+            $idx = 0
+            foreach ($siteUrl in $toScan) {
+                $idx++
+                # Progression + ETA
+                $elapsed = (Get-Date) - $Script:StartTime
+                $eta = ""
+                if ($idx -gt 1) {
+                    $perSite = $elapsed.TotalSeconds / ($idx - 1)
+                    $remain  = [TimeSpan]::FromSeconds($perSite * ($totalSites - $idx + 1))
+                    $eta = " - ETA ~$([math]::Floor($remain.TotalMinutes))min"
+                }
+                Write-Log "[$idx/$totalSites] $siteUrl$eta" -Level SECTION
+
+                # Reconnexion preventive du token (scans longs)
+                Test-TokenRefresh -Url $siteUrl
+
+                try {
+                    # Le scan d un site avec retry sur throttling
+                    Invoke-WithRetry -Context $siteUrl -Action { Invoke-ScanSite -Url $siteUrl }
+                    # Persister immediatement les resultats de ce site
+                    Save-SiteResults -SiteUrl $siteUrl
+                } catch {
+                    Write-Log "Site ignore apres echec : $siteUrl - $_" -Level ERROR
+                    $Script:ScanErrors.Add([PSCustomObject]@{ Site = $siteUrl; Error = "$_" })
+                    # On marque quand meme le site comme traite pour ne pas boucler en -Resume
+                    Save-SiteResults -SiteUrl $siteUrl
+                }
+            }
         }
     }
 
     Write-Log "Scan complete. Total objects scanned: $Script:TotalScanned" -Level OK
     New-HtmlReport
+
+    # Nettoyer le checkpoint apres un scan complet reussi
+    if ($Script:CheckpointPath -and (Test-Path $Script:CheckpointPath)) {
+        Remove-Item $Script:CheckpointPath -Force -ErrorAction SilentlyContinue
+        Write-Log "Checkpoint supprime (scan termine avec succes)" -Level INFO
+    }
 
     Write-Log "═══════════════════════════════════" -Level SECTION
     Write-Log "  Done! Report: $OutputPath" -Level OK

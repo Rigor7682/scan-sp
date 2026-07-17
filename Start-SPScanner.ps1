@@ -161,6 +161,13 @@ a{color:#60a5fa;text-decoration:none}a:hover{text-decoration:underline}
           </label>
           <div class="fh">Augmente fortement la duree du scan (un site par utilisateur)</div>
         </div>
+        <div class="fr" id="resume-row" style="display:none">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;text-transform:none;font-weight:400">
+            <input type="checkbox" id="fresume" style="width:16px;height:16px;cursor:pointer">
+            <span style="font-size:13px;color:#e2e8f0">Reprendre le dernier scan interrompu</span>
+          </label>
+          <div class="fh">Ignore les sites deja scannes (reprise apres plantage/arret)</div>
+        </div>
         <div style="display:flex;gap:8px;align-items:center">
           <button class="btn bp" id="bs" onclick="startScan()">&#9654; Lancer le scan</button>
           <button class="btn bd" id="bst" style="display:none" onclick="stopScan()">&#9632; Arreter</button>
@@ -206,13 +213,14 @@ function onMC(){
   document.getElementById('url-row').style.display=(m==='AllSites')?'none':'';
   document.getElementById('admin-row').style.display=(m==='AllSites')?'':'none';
   document.getElementById('onedrive-row').style.display=(m==='AllSites')?'':'none';
+  document.getElementById('resume-row').style.display=(m==='AllSites')?'':'none';
 }
 function startScan(){
-  var mode=document.getElementById('fm').value,url=document.getElementById('fu').value.trim(),depth=document.getElementById('fd').value,user=document.getElementById('fuser').value.trim(),cmp=document.getElementById('fcmp').value.trim(),onedrive=document.getElementById('fonedrive').checked;
+  var mode=document.getElementById('fm').value,url=document.getElementById('fu').value.trim(),depth=document.getElementById('fd').value,user=document.getElementById('fuser').value.trim(),cmp=document.getElementById('fcmp').value.trim(),onedrive=document.getElementById('fonedrive').checked,resume=document.getElementById('fresume').checked;
   if(mode!=='AllSites'&&!url){alert('URL du site requise.');return;}
   clearLog();addLog('Demarrage du scan...','se');
   setStatus('r');document.getElementById('bs').disabled=true;document.getElementById('bst').style.display='';document.getElementById('pw').style.display='';
-  fetch('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode,siteUrl:url,tenantAdminUrl:document.getElementById('fadmin').value.trim(),scanDepth:depth,focusUser:user,compareWith:cmp,includeOneDrive:onedrive})})
+  fetch('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode,siteUrl:url,tenantAdminUrl:document.getElementById('fadmin').value.trim(),scanDepth:depth,focusUser:user,compareWith:cmp,includeOneDrive:onedrive,resume:resume})})
     .then(function(r){return r.json();})
     .then(function(d){if(d.error){addLog('Erreur: '+d.error,'er');resetBtn();return;}addLog('Scan demarre - PID: '+d.pid,'ok');pollT=setInterval(poll,1200);})
     .catch(function(e){addLog('Erreur: '+e,'er');resetBtn();});
@@ -293,6 +301,33 @@ function Start-ScanProcess {
     $logOut  = $outPath -replace '\.html$', '.log'
     $logErr  = $outPath -replace '\.html$', '.err'
 
+    # ── VALIDATION DES ENTREES (anti-injection de commande) ──
+    # Les parametres viennent du web : on valide STRICTEMENT avant de les passer en ligne de commande.
+    $validModes  = @('SingleSite', 'SiteCollection', 'AllSites')
+    $validDepths = @('Site', 'SiteAndLibraries', 'Full')
+
+    if ($Params.mode -notin $validModes) {
+        return @{ error = "Mode invalide" }
+    }
+    if ($Params.scanDepth -notin $validDepths) {
+        return @{ error = "Profondeur invalide" }
+    }
+
+    # Une URL SharePoint legitime : https, domaine sharepoint.com, pas de caractere shell
+    function Test-SafeUrl {
+        param([string]$Url)
+        if (-not $Url) { return $false }
+        # Rejette tout caractere pouvant servir a l injection
+        if ($Url -match '[''";&|`$<>(){}\s]') { return $false }
+        return $Url -match '^https://[A-Za-z0-9.\-]+\.sharepoint\.com(/[A-Za-z0-9._\-/%]*)?$'
+    }
+    # Un identifiant utilisateur (UPN/email/nom) sans caractere shell
+    function Test-SafePrincipal {
+        param([string]$P)
+        if (-not $P) { return $false }
+        return $P -notmatch '[''";&|`$<>(){}]' -and $P.Length -le 256
+    }
+
     # Construire les arguments en ligne de commande
     $argList = [System.Collections.Generic.List[string]]::new()
     $argList.Add('-NonInteractive')
@@ -309,6 +344,7 @@ function Start-ScanProcess {
 
     if ($Params.mode -eq 'AllSites') {
         if ($Params.tenantAdminUrl -and $Params.tenantAdminUrl -ne '') {
+            if (-not (Test-SafeUrl $Params.tenantAdminUrl)) { return @{ error = "URL admin tenant invalide" } }
             $argList.Add('-TenantAdminUrl'); $argList.Add("`"$($Params.tenantAdminUrl)`"")
         } else {
             # Construire l URL admin depuis le tenant
@@ -319,17 +355,24 @@ function Start-ScanProcess {
             }
         }
     } elseif ($Params.siteUrl -and $Params.siteUrl -ne '') {
+        if (-not (Test-SafeUrl $Params.siteUrl)) { return @{ error = "URL de site invalide" } }
         $argList.Add('-SiteUrl'); $argList.Add("`"$($Params.siteUrl)`"")
     }
     if ($Params.focusUser -and $Params.focusUser -ne '') {
+        if (-not (Test-SafePrincipal $Params.focusUser)) { return @{ error = "Utilisateur invalide" } }
         $argList.Add('-FocusUser'); $argList.Add("`"$($Params.focusUser)`"")
     }
     if ($Params.compareWith -and $Params.compareWith -ne '') {
-        $cmpPath = Join-Path $ScanDir $Params.compareWith
+        # Anti path-traversal : on ne garde que le nom de fichier
+        $cmpName = [IO.Path]::GetFileName([string]$Params.compareWith)
+        $cmpPath = Join-Path $ScanDir $cmpName
         if (Test-Path $cmpPath) { $argList.Add('-CompareWith'); $argList.Add("`"$cmpPath`"") }
     }
     if ($Params.PSObject.Properties['includeOneDrive'] -and $Params.includeOneDrive) {
         $argList.Add('-IncludeOneDrive')
+    }
+    if ($Params.PSObject.Properties['resume'] -and $Params.resume) {
+        $argList.Add('-Resume')
     }
 
     # Utiliser Start-Process avec redirection native (pas d events .NET)
@@ -455,10 +498,19 @@ function Start-Server {
                     elseif ($Script:ScanProcess -and -not $Script:ScanProcess.HasExited) {
                         Send-Json -Res $res -Data '{"error":"Scan deja en cours"}'
                     } else {
-                        $body   = [IO.StreamReader]::new($req.InputStream).ReadToEnd()
-                        $params = $body | ConvertFrom-Json
-                        $result = Start-ScanProcess -Params $params
-                        Send-Json -Res $res -Data $result
+                        $body = [IO.StreamReader]::new($req.InputStream).ReadToEnd()
+                        # Limiter la taille du corps (anti-DoS) et parser de facon defensive
+                        if ($body.Length -gt 8192) {
+                            Send-Json -Res $res -Data '{"error":"Requete trop volumineuse"}'
+                        } else {
+                            try {
+                                $params = $body | ConvertFrom-Json -ErrorAction Stop
+                                $result = Start-ScanProcess -Params $params
+                                Send-Json -Res $res -Data $result
+                            } catch {
+                                Send-Json -Res $res -Data '{"error":"Requete JSON invalide"}'
+                            }
+                        }
                     }
                 }
 
@@ -477,9 +529,17 @@ function Start-Server {
 
                 '/reports/*' {
                     $fname = [IO.Path]::GetFileName($req.Url.LocalPath)
-                    $fpath = Join-Path $ScanDir $fname
-                    if (Test-Path $fpath) { Send-File -Res $res -Path $fpath }
-                    else { $res.StatusCode = 404; $b = [Text.Encoding]::UTF8.GetBytes("Not found: $fname"); $res.ContentLength64 = $b.Length; $res.OutputStream.Write($b, 0, $b.Length) }
+                    $ext   = [IO.Path]::GetExtension($fname).ToLower()
+                    # N autoriser que les extensions de rapport (defense en profondeur)
+                    if ($ext -notin @('.html', '.csv', '.json')) {
+                        $res.StatusCode = 403
+                        $b = [Text.Encoding]::UTF8.GetBytes("Type de fichier non autorise")
+                        $res.ContentLength64 = $b.Length; $res.OutputStream.Write($b, 0, $b.Length)
+                    } else {
+                        $fpath = Join-Path $ScanDir $fname
+                        if (Test-Path $fpath) { Send-File -Res $res -Path $fpath }
+                        else { $res.StatusCode = 404; $b = [Text.Encoding]::UTF8.GetBytes("Not found: $fname"); $res.ContentLength64 = $b.Length; $res.OutputStream.Write($b, 0, $b.Length) }
+                    }
                 }
 
                 default { $res.StatusCode = 404 }
