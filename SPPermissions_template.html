@@ -154,8 +154,9 @@ a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}
 @media print {
   body * { visibility: hidden; }
   #print-summary, #print-summary * { visibility: visible; }
-  #print-summary { position: absolute; left: 0; top: 0; width: 100%; padding: 20px; }
-  .header, .tabs, .toolbar, .site-sidebar, .footer { display: none !important; }
+  #print-summary { display: block !important; position: absolute; left: 0; top: 0; width: 100%; padding: 20px; }
+  .header, .tabs, .toolbar, .site-sidebar, .footer, .layout { display: none !important; }
+  @page { margin: 1cm; }
 }
 #print-summary { display: none; }
 .ps-header{display:flex;align-items:center;justify-content:space-between;border-bottom:2px solid #2563eb;padding-bottom:12px;margin-bottom:20px}
@@ -174,15 +175,17 @@ a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}
 <body>
 <header class="header">
   <div class="brand"><div class="logo">SP</div><div>
-    <div class="brand-title">SharePoint <span>Permissions</span></div>
+    <div class="brand-title">SharePoint <span>Permissions</span>
+      <span onclick="openHelp()" style="cursor:pointer;display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:50%;background:#eff6ff;color:#2563eb;font-size:12px;font-weight:700;margin-left:8px;border:1px solid #bfdbfe;vertical-align:middle" title="Guide de lecture du rapport">?</span>
+    </div>
     <div class="brand-sub" id="meta-sub">Chargement...</div>
   </div></div>
   <div class="stats">
-    <div class="stat s-blue"><div class="stat-n" id="s-sites">-</div><div class="stat-l">Sites</div></div>
-    <div class="stat"><div class="stat-n" id="s-rows">-</div><div class="stat-l">Lignes</div></div>
-    <div class="stat s-warn"><div class="stat-n" id="s-uniq">-</div><div class="stat-l">Uniques</div></div>
-    <div class="stat s-crit"><div class="stat-n" id="s-crit">-</div><div class="stat-l">Critiques</div></div>
-    <div class="stat s-red"><div class="stat-n" id="s-high">-</div><div class="stat-l">Eleves</div></div>
+    <div class="stat s-blue" title="Nombre de sites SharePoint analyses"><div class="stat-n" id="s-sites">-</div><div class="stat-l">Sites</div></div>
+    <div class="stat" title="Nombre total de lignes de permissions dans le rapport"><div class="stat-n" id="s-rows">-</div><div class="stat-l">Lignes</div></div>
+    <div class="stat s-warn" title="Objets dont les permissions different de leur parent (heritage brise)"><div class="stat-n" id="s-uniq">-</div><div class="stat-l">Uniques</div></div>
+    <div class="stat s-crit" title="Risques critiques : acces public (Everyone) ou lien de partage Anyone"><div class="stat-n" id="s-crit">-</div><div class="stat-l">Critiques</div></div>
+    <div class="stat s-red" title="Risques eleves : utilisateurs externes ou Full Control direct"><div class="stat-n" id="s-high">-</div><div class="stat-l">Eleves</div></div>
     <div class="stat s-green" id="s-add-w" style="display:none"><div class="stat-n" id="s-add">-</div><div class="stat-l">Ajoutes</div></div>
   </div>
 </header>
@@ -455,17 +458,45 @@ function sort(f){if(sf===f)sa=!sa;else{sf=f;sa=true;}render();}
 function showTab(id,btn){document.querySelectorAll('.tab-panel').forEach(function(p){p.classList.remove('on');});document.querySelectorAll('.tab').forEach(function(b){b.classList.remove('on');});document.getElementById('tab-'+id).classList.add('on');btn.classList.add('on');}
 function buildUsers(){
   var users={};
-  DATA.forEach(function(r){var p=r.Principal,l=r.LoginName,t=r.PrincipalType;if(!p||p==='(inherited)'||p==='(no assignments)')return;var key=l||p;if(!users[key])users[key]={name:p,login:l,type:t,items:[]};users[key].items.push({ot:r.ObjectType,name:r.ObjectName,url:r.ObjectUrl,lvl:r.PermissionLevel,hu:r.HasUniquePermissions,site:r.SiteName,risk:r.Risk});});
-  var keys=Object.keys(users).sort(),h='',th='';
+  function ensureUser(key,name,login,type){
+    if(!users[key])users[key]={name:name,login:login,type:type,items:[]};
+    return users[key];
+  }
+  DATA.forEach(function(r){
+    var p=r.Principal,l=r.LoginName,t=r.PrincipalType;
+    if(!p||p==='(inherited)'||p==='(no assignments)')return;
+
+    // 1. Le principal lui-meme (user ou groupe)
+    var key=l||p;
+    var u=ensureUser(key,p,l,t);
+    u.items.push({ot:r.ObjectType,name:r.ObjectName,url:r.ObjectUrl,lvl:r.PermissionLevel,hu:r.HasUniquePermissions,site:r.SiteName,risk:r.Risk,via:''});
+
+    // 2. Si c est un groupe, attribuer l acces a chacun de ses membres (via le groupe)
+    if((t==='SP Group'||t==='Security Group') && GROUP_MEMBERS[p]){
+      GROUP_MEMBERS[p].forEach(function(m){
+        var mKey=m.login||m.email||m.name;
+        if(!mKey)return;
+        var mu=ensureUser(mKey,m.name||m.email,m.email||m.login,'User');
+        mu.items.push({ot:r.ObjectType,name:r.ObjectName,url:r.ObjectUrl,lvl:r.PermissionLevel,hu:r.HasUniquePermissions,site:r.SiteName,risk:r.Risk,via:p});
+      });
+    }
+  });
+  var keys=Object.keys(users).sort(function(a,b){return (users[a].name||'').localeCompare(users[b].name||'');}),h='',th='';
   keys.forEach(function(key,i){
-    var u=users[key],risks=u.items.filter(function(x){return x.risk&&x.risk!=='OK';}).length,uniqN=u.items.filter(function(x){return x.hu==='True';}).length,tb=u.type==='User'?'b-user':u.type==='SP Group'?'b-sp':'b-sec';
+    var u=users[key],risks=u.items.filter(function(x){return x.risk&&x.risk!=='OK';}).length,uniqN=u.items.filter(function(x){return x.hu==='True';}).length,viaN=u.items.filter(function(x){return x.via;}).length,tb=u.type==='User'?'b-user':u.type==='SP Group'?'b-sp':'b-sec';
     h+='<div class="user-card" id="uc-'+i+'"><span class="utog" onclick="togCard('+i+')">&#9654; '+u.items.length+' acces</span>';
     h+='<div class="user-name"><span class="badge '+tb+'" style="margin-right:6px">'+esc(u.type)+'</span>'+esc(u.name)+'</div>';
     h+='<div class="user-login">'+esc(u.login)+'</div>';
     h+='<div class="user-stats"><span class="ust">'+u.items.length+' objets</span><span class="ust">'+uniqN+' uniques</span>';
+    if(viaN)h+='<span class="ust" style="color:#7c3aed;border-color:#c4b5fd">'+viaN+' via groupe</span>';
     if(risks)h+='<span class="ust" style="color:#dc2626;border-color:#fca5a5">'+risks+' risque(s)</span>';
     h+='</div><div class="user-objs" id="uo-'+i+'">';
-    u.items.forEach(function(it){var otc=it.ot.toLowerCase().replace('library','lib');h+='<div class="urow"><span class="badge b-'+otc+'" style="flex-shrink:0">'+esc(it.ot)+'</span><a href="'+esc(it.url)+'" target="_blank" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(it.name)+'</a><span class="perm '+lvlClass(it.lvl)+'" style="flex-shrink:0">'+esc(it.lvl)+'</span>'+(it.risk&&it.risk!=='OK'?'<span style="color:#dc2626;font-size:10px" title="'+esc(it.risk)+'">&#9888;</span>':'')+'</div>';th+='<tr><td>'+esc(u.name)+'</td><td>'+esc(u.login)+'</td><td>'+esc(u.type)+'</td><td>'+esc(it.ot)+'</td><td>'+esc(it.name)+'</td><td>'+esc(it.lvl)+'</td><td>'+esc(it.hu)+'</td><td>'+esc(it.site)+'</td></tr>';});
+    u.items.forEach(function(it){
+      var otc=it.ot.toLowerCase().replace('library','lib');
+      var viaBadge=it.via?'<span class="badge b-sp" style="flex-shrink:0;font-size:9px" title="Acces herite du groupe '+esc(it.via)+'">via '+esc(it.via)+'</span>':'';
+      h+='<div class="urow"><span class="badge b-'+otc+'" style="flex-shrink:0">'+esc(it.ot)+'</span><a href="'+esc(it.url)+'" target="_blank" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(it.name)+'</a>'+viaBadge+'<span class="perm '+lvlClass(it.lvl)+'" style="flex-shrink:0">'+esc(it.lvl)+'</span>'+(it.risk&&it.risk!=='OK'?'<span style="color:#dc2626;font-size:10px" title="'+esc(it.risk)+'">&#9888;</span>':'')+'</div>';
+      th+='<tr><td>'+esc(u.name)+'</td><td>'+esc(u.login)+'</td><td>'+esc(u.type)+'</td><td>'+esc(it.ot)+'</td><td>'+esc(it.name)+'</td><td>'+esc(it.lvl)+'</td><td>'+esc(it.via||'Direct')+'</td><td>'+esc(it.site)+'</td></tr>';
+    });
     h+='</div></div>';
   });
   document.getElementById('user-cards').innerHTML=h||'<div class="loading">Aucun utilisateur.</div>';
@@ -496,7 +527,15 @@ function ptBadge(t,principal){
   return '<span class="badge b-inh">'+(t||'-')+'</span>';
 }
 function permBadge(l){if(!l||l==='-')return '<span style="color:#94a3b8">-</span>';return '<span class="perm '+lvlClass(l)+'">'+esc(l)+'</span>';}
-function riskBadge(r){if(!r||r==='OK')return '<span class="risk-ok">OK</span>';if(r.startsWith('CRITIQUE'))return '<span class="risk-crit">'+esc(r)+'</span>';if(r.startsWith('ELEVE'))return '<span class="risk-high">'+esc(r)+'</span>';return '<span class="risk-med">'+esc(r)+'</span>';}
+function riskBadge(r){
+  if(!r||r==='OK')return '<span class="risk-ok">&#10003; OK</span>';
+  // Plusieurs risques separes par " | " : badge compact + detail complet au survol
+  var n=r.split(' | ').length;
+  var extra=n>1?' (+'+(n-1)+')':'';
+  if(r.startsWith('CRITIQUE'))return '<span class="badge" style="background:#fef2f2;color:#dc2626;border:1px solid #fca5a5;cursor:help" title="'+esc(r)+'">&#9888; CRITIQUE'+extra+'</span>';
+  if(r.startsWith('ELEVE'))return '<span class="badge" style="background:#fff7ed;color:#ea580c;border:1px solid #fed7aa;cursor:help" title="'+esc(r)+'">&#9650; ELEVE'+extra+'</span>';
+  return '<span class="badge" style="background:#fffbeb;color:#d97706;border:1px solid #fcd34d;cursor:help" title="'+esc(r)+'">&#9679; MOYEN'+extra+'</span>';
+}
 function lvlClass(l){var s=(l||'').toLowerCase();if(s.indexOf('full control')!==-1)return 'p-full';if(s.indexOf('edit')!==-1||s.indexOf('design')!==-1)return 'p-edit';if(s.indexOf('contribut')!==-1)return 'p-contrib';if(s.indexOf('read')!==-1||s.indexOf('view')!==-1)return 'p-read';return 'p-other';}
 function exportTable(id){var tbl=document.getElementById(id);if(!tbl)return;var hs=Array.from(tbl.querySelectorAll('thead th')).map(function(h){return '"'+h.textContent.trim()+'"';});var rows=[hs.join(',')];tbl.querySelectorAll('tbody tr').forEach(function(tr){if(tr.style.display==='none')return;rows.push(Array.from(tr.querySelectorAll('td')).map(function(c){return '"'+c.textContent.trim().replace(/"/g,'""')+'"';}).join(','));});var a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['\uFEFF'+rows.join('\n')],{type:'text/csv;charset=utf-8;'}));a.download='sp-export-'+id+'.csv';a.click();}
 function esc(s){if(!s)return '';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
@@ -680,18 +719,20 @@ function buildPrintSummary(){
 function exportHTML(){
   // Creer un HTML autonome avec les donnees embarquees (pas besoin du CSV)
   var html=document.documentElement.outerHTML;
+  var embId='_emb';
+  var openTag='<scr'+'ipt id="'+embId+'">';
+  var closeTag='<\/scr'+'ipt>';
 
-  // Injecter les donnees comme variable globale avant </head>
+  // Supprimer une eventuelle injection precedente (re-export d un fichier deja exporte)
+  var re=new RegExp(openTag+'[^]*?'+closeTag,'g');
+  html=html.replace(re,'');
+
+  // Injecter les donnees comme variable globale avant la fermeture du head
+  // Echapper "<" en \u003c pour eviter qu une balise de fermeture dans les donnees ne casse le bloc
   var embedded={data:DATA,meta:META,added:DIFF_ADDED,removed:DIFF_REMOVED};
-  var script='<script id="_emb">window.__EMBEDDED__='+JSON.stringify(embedded)+';<\/script>';
-  html=html.replace('</head>',script+'</head>');
-
-  // Supprimer l injection precedente si re-export d un fichier deja exporte
-  html=html.replace(/<script id="_emb">.*?<\/script>/g,'');
-  // Re-injecter proprement
-  var embedded2={data:DATA,meta:META,added:DIFF_ADDED,removed:DIFF_REMOVED};
-  var script2='<script id="_emb">window.__EMBEDDED__='+JSON.stringify(embedded2)+';<\/script>';
-  html=html.replace('</head>',script2+'</head>');
+  var json=JSON.stringify(embedded).replace(/</g,'\\u003c');
+  var script=openTag+'window.__EMBEDDED__='+json+';'+closeTag;
+  html=html.replace('<\/head'+'>',script+'<\/head'+'>');
 
   var fname='SPPermissions_export_'+new Date().toISOString().slice(0,10)+'.html';
   var a=document.createElement('a');
@@ -712,7 +753,7 @@ function showGroupModal(groupName, groupType) {
     body.innerHTML = '<div class="modal-empty">&#128100; Aucun membre ou groupe AAD (non disponible sans permissions Graph)</div>';
   } else {
     body.innerHTML = members.map(function(m) {
-      var initials = (m.name||'?').split(' ').map(function(w){return w[0]||'';}).slice(0,2).join('').toUpperCase();
+      var initials = esc((m.name||'?').split(' ').map(function(w){return w[0]||'';}).slice(0,2).join('').toUpperCase());
       return '<div class="modal-member">' +
         '<div class="member-avatar">' + initials + '</div>' +
         '<div><div class="member-name">' + esc(m.name||'') + '</div>' +
@@ -728,7 +769,10 @@ function closeGroupModal() {
 function closeModal(e) {
   if (e.target === document.getElementById('gm-overlay')) closeGroupModal();
 }
-document.addEventListener('keydown', function(e) { if (e.key === 'Escape') closeGroupModal(); });
+document.addEventListener('keydown', function(e) { if (e.key === 'Escape') { closeGroupModal(); closeHelp(); } });
+
+function openHelp(){document.getElementById('help-overlay').classList.add('open');}
+function closeHelp(){document.getElementById('help-overlay').classList.remove('open');}
 </script>
 
 <!-- GROUP MEMBERS MODAL -->
@@ -747,5 +791,55 @@ document.addEventListener('keydown', function(e) { if (e.key === 'Escape') close
 
 <!-- RESUME EXECUTIF (visible uniquement a l impression PDF) -->
 <div id="print-summary"></div>
+
+<!-- GUIDE DE LECTURE -->
+<div class="modal-overlay" id="help-overlay" onclick="if(event.target===this)closeHelp()">
+  <div class="modal" style="max-width:640px;max-height:85vh">
+    <div class="modal-head">
+      <div><div class="modal-title">Guide de lecture du rapport</div>
+      <div class="modal-sub">Comprendre les permissions SharePoint en un coup d oeil</div></div>
+      <button class="modal-close" onclick="closeHelp()">&#x2715;</button>
+    </div>
+    <div class="modal-body" style="padding:16px 20px;font-size:13px;line-height:1.6">
+
+      <h3 style="font-size:13px;color:#2563eb;margin:4px 0 8px">Les onglets</h3>
+      <p style="margin-bottom:4px"><b>Vue d'ensemble</b> — la synthese : chiffres cles, points d attention en langage clair, sites les plus exposes.</p>
+      <p style="margin-bottom:4px"><b>Permissions</b> — le detail complet, objet par objet. Utilisez la barre laterale pour filtrer par site.</p>
+      <p style="margin-bottom:4px"><b>Vue utilisateur</b> — qui a acces a quoi. Inclut les acces herites via les groupes (badge "via [groupe]").</p>
+      <p style="margin-bottom:12px"><b>Risques</b> — uniquement les permissions dangereuses, triables par severite.</p>
+
+      <h3 style="font-size:13px;color:#2563eb;margin:12px 0 8px">Source des droits</h3>
+      <p style="margin-bottom:4px"><span class="badge b-uniq">Propre</span> &nbsp;L objet a <b>ses propres permissions</b>, differentes de son parent (heritage brise). C est la qu il faut regarder en priorite : chaque rupture d heritage est une exception a auditer.</p>
+      <p style="margin-bottom:12px"><span class="badge b-inh">Herite</span> &nbsp;L objet suit les permissions de son parent (site ou bibliotheque). Rien de special a verifier ici.</p>
+
+      <h3 style="font-size:13px;color:#2563eb;margin:12px 0 8px">Qui a acces (nature)</h3>
+      <p style="margin-bottom:4px"><span class="badge b-user">&#128100; User</span> &nbsp;Un utilisateur nomme directement. Un Full Control direct sur un user est une mauvaise pratique (preferez les groupes).</p>
+      <p style="margin-bottom:4px"><span class="badge b-sp">&#128101; SP Group</span> &nbsp;Groupe SharePoint (Owners/Members/Visitors). <b>Cliquez dessus</b> pour voir ses membres.</p>
+      <p style="margin-bottom:4px"><span class="badge b-sec">&#128101; Sec Group</span> &nbsp;Groupe de securite Azure AD. <b>Cliquez dessus</b> pour voir ses membres (y compris groupes imbriques).</p>
+      <p style="margin-bottom:12px"><span class="badge b-share">&#128279; Lien</span> &nbsp;Lien de partage. Les liens "Anyone" sont accessibles <b>sans authentification</b> par quiconque possede l URL.</p>
+
+      <h3 style="font-size:13px;color:#2563eb;margin:12px 0 8px">Types d acces</h3>
+      <p style="margin-bottom:12px">
+        <span class="perm p-full">Full Control</span> tout faire, y compris supprimer et gerer les droits &middot;
+        <span class="perm p-edit">Edit</span> modifier le contenu &middot;
+        <span class="perm p-contrib">Contribute</span> ajouter/modifier ses documents &middot;
+        <span class="perm p-read">Read</span> lecture seule
+      </p>
+
+      <h3 style="font-size:13px;color:#2563eb;margin:12px 0 8px">Niveaux de risque</h3>
+      <p style="margin-bottom:4px"><b style="color:#dc2626">&#9888; CRITIQUE</b> — acces public : "Everyone" ou lien de partage "Anyone". N importe qui peut acceder. A corriger immediatement.</p>
+      <p style="margin-bottom:4px"><b style="color:#ea580c">&#9650; ELEVE</b> — utilisateur externe au tenant, Full Control direct sur un user, ou lien organisation en modification.</p>
+      <p style="margin-bottom:4px"><b style="color:#d97706">&#9679; MOYEN</b> — Edit direct sur un user, Full Control via groupe de securite, lien organisation en lecture.</p>
+      <p style="margin-bottom:12px">Survolez un badge de risque pour voir le detail complet. "(+2)" signifie que l objet cumule plusieurs risques.</p>
+
+      <h3 style="font-size:13px;color:#2563eb;margin:12px 0 8px">Astuces</h3>
+      <p style="margin-bottom:4px">&bull; <b>Groupe supprime d Azure AD</b> dans une popup de membres = permission orpheline a nettoyer.</p>
+      <p style="margin-bottom:4px">&bull; <b>Export HTML</b> genere un fichier autonome a envoyer par mail (donnees incluses).</p>
+      <p style="margin-bottom:4px">&bull; <b>Resume PDF</b> imprime une synthese d une page pour le management.</p>
+      <p style="margin-bottom:4px">&bull; Le bouton <b>Grouper par site</b> reorganise le tableau en sections repliables.</p>
+
+    </div>
+  </div>
+</div>
 </body>
 </html>

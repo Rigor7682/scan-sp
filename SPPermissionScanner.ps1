@@ -138,6 +138,10 @@ $Script:ScanErrors    = [System.Collections.Generic.List[PSCustomObject]]::new()
 $Script:TotalScanned  = 0
 $Script:GroupMembers  = [System.Collections.Generic.Dictionary[string,object]]::new()
 $Script:StartTime     = Get-Date
+$Script:CurrentSiteGroupId = $null  # GroupId M365 du site en cours (Team-connected site)
+$Script:CurrentOwnerGroupId  = $null  # Id du groupe SP "Owners" du site en cours
+$Script:CurrentMemberGroupId = $null  # Id du groupe SP "Members" du site en cours
+$Script:CurrentVisitorGroupId= $null  # Id du groupe SP "Visitors" du site en cours
 
 # ── Resilience (gros scans) ──
 $Script:CsvStreamPath   = $null   # CSV ecrit au fil de l eau
@@ -435,62 +439,58 @@ function Invoke-ScanList {
         # Scanner les items selon le ScanDepth
         if ($ScanDepth -eq "Full" -and $List.BaseType -eq "DocumentLibrary") {
 
-            # Optimisation : si la librairie herite du site, ses items heritent aussi en cascade.
-            # Inutile de scanner chaque item — on saute directement.
-            if (-not $hasUnique) {
-                Write-Log "    [SKIP] $($List.Title) herite ses permissions - items non scannes." -Level INFO
+            # IMPORTANT : meme si la bibliotheque herite du site, un fichier/dossier
+            # a l interieur peut avoir des permissions uniques (partage individuel).
+            # On interroge donc TOUJOURS les items via REST (1 appel par bibliotheque)
+            # et on ne scanne en profondeur que ceux avec HasUniqueRoleAssignments=true.
+            $listId   = $List.Id
+            $restUrl  = "/_api/web/lists(guid'$listId')/items?" +
+                        "`$select=Id,FileLeafRef,FileRef,FSObjType,HasUniqueRoleAssignments" +
+                        "&`$top=5000"
+
+            try {
+                $restResult  = Invoke-PnPSPRestMethod -Url $restUrl -Method Get
+                $allItems    = @($restResult.value)
+                $uniqueItems = @($allItems | Where-Object { $_.HasUniqueRoleAssignments -eq $true })
+            } catch {
+                # Fallback : Get-PnPListItem sans HasUniqueRoleAssignments, puis check individuel
+                Write-Log "    REST fallback: $_ - utilisation de Get-PnPListItem" -Level WARN
+                $pnpItems    = @(Get-PnPListItem -List $List.Id `
+                    -Fields "FileLeafRef","FileRef","FSObjType" -PageSize 500)
+                $allItems    = $pnpItems
+                # Charger HasUniqueRoleAssignments item par item (plus lent)
+                $uniqueItems = @($pnpItems | Where-Object {
+                    try {
+                        Get-PnPProperty -ClientObject $_ -Property HasUniqueRoleAssignments | Out-Null
+                        $_.HasUniqueRoleAssignments
+                    } catch { $false }
+                })
+            }
+
+            $totalItems = $allItems.Count
+            Write-Log "    $totalItems items dans $($List.Title) - $($uniqueItems.Count) avec permissions uniques" -Level INFO
+
+            if ($uniqueItems.Count -eq 0) {
+                Write-Log "    [SKIP] Aucun item avec permissions uniques." -Level INFO
             } else {
-                # La librairie a des permissions uniques : recuperer les items via REST
-                # (HasUniqueRoleAssignments disponible en un seul appel REST, pas via -Includes PnP)
-                $listId   = $List.Id
-                $restUrl  = "/_api/web/lists(guid'$listId')/items?" +
-                            "`$select=Id,FileLeafRef,FileRef,FSObjType,HasUniqueRoleAssignments" +
-                            "&`$top=5000"
-
-                try {
-                    $restResult  = Invoke-PnPSPRestMethod -Url $restUrl -Method Get
-                    $allItems    = @($restResult.value)
-                    $uniqueItems = @($allItems | Where-Object { $_.HasUniqueRoleAssignments -eq $true })
-                } catch {
-                    # Fallback : Get-PnPListItem sans HasUniqueRoleAssignments, puis check individuel
-                    Write-Log "    REST fallback: $_ - utilisation de Get-PnPListItem" -Level WARN
-                    $pnpItems    = @(Get-PnPListItem -List $List.Id `
-                        -Fields "FileLeafRef","FileRef","FSObjType" -PageSize 500)
-                    $allItems    = $pnpItems
-                    # Charger HasUniqueRoleAssignments item par item (plus lent)
-                    $uniqueItems = @($pnpItems | Where-Object {
-                        try {
-                            Get-PnPProperty -ClientObject $_ -Property HasUniqueRoleAssignments | Out-Null
-                            $_.HasUniqueRoleAssignments
-                        } catch { $false }
-                    })
-                }
-
-                $totalItems = $allItems.Count
-                Write-Log "    $totalItems items dans $($List.Title) - $($uniqueItems.Count) avec permissions uniques" -Level INFO
-
-                if ($uniqueItems.Count -eq 0) {
-                    Write-Log "    [SKIP] Aucun item avec permissions uniques." -Level INFO
-                } else {
-                    foreach ($item in $uniqueItems) {
-                        # Reconstruire un objet compatible avec Invoke-ScanItem
-                        # REST renvoie des hashtables, PnP renvoie des ListItem
-                        if ($item -is [System.Collections.Hashtable] -or $item.PSObject.Properties["FileLeafRef"]) {
-                            # Objet REST - charger via Get-PnPListItem pour avoir le bon type
-                            $pnpItem = Get-PnPListItem -List $List.Id -Id $item.Id `
-                                -Includes HasUniqueRoleAssignments, RoleAssignments
-                            $fsoType  = $item.FSObjType
-                            $itemType = if ($fsoType -eq 1) { "Folder" } else { "File" }
-                            Invoke-ScanItem -SiteUrl $SiteUrl -SiteName $SiteName `
-                                -ListTitle $List.Title -Item $pnpItem `
-                                -ParentName $List.Title -ObjectType $itemType
-                        } else {
-                            $fsoType  = $item.FieldValues["FSObjType"]
-                            $itemType = if ($fsoType -eq 1) { "Folder" } else { "File" }
-                            Invoke-ScanItem -SiteUrl $SiteUrl -SiteName $SiteName `
-                                -ListTitle $List.Title -Item $item `
-                                -ParentName $List.Title -ObjectType $itemType
-                        }
+                foreach ($item in $uniqueItems) {
+                    # Reconstruire un objet compatible avec Invoke-ScanItem
+                    # REST renvoie des hashtables, PnP renvoie des ListItem
+                    if ($item -is [System.Collections.Hashtable] -or $item.PSObject.Properties["FileLeafRef"]) {
+                        # Objet REST - charger via Get-PnPListItem pour avoir le bon type
+                        $pnpItem = Get-PnPListItem -List $List.Id -Id $item.Id `
+                            -Includes HasUniqueRoleAssignments, RoleAssignments
+                        $fsoType  = $item.FSObjType
+                        $itemType = if ($fsoType -eq 1) { "Folder" } else { "File" }
+                        Invoke-ScanItem -SiteUrl $SiteUrl -SiteName $SiteName `
+                            -ListTitle $List.Title -Item $pnpItem `
+                            -ParentName $List.Title -ObjectType $itemType
+                    } else {
+                        $fsoType  = $item.FieldValues["FSObjType"]
+                        $itemType = if ($fsoType -eq 1) { "Folder" } else { "File" }
+                        Invoke-ScanItem -SiteUrl $SiteUrl -SiteName $SiteName `
+                            -ListTitle $List.Title -Item $item `
+                            -ParentName $List.Title -ObjectType $itemType
                     }
                 }
             }
@@ -502,18 +502,190 @@ function Invoke-ScanList {
 }
 
 function Get-GroupMembers {
-    param([string]$GroupTitle, [string]$LoginName, [string]$PrincipalType)
+    param([string]$GroupTitle, [string]$LoginName, [string]$PrincipalType, [Nullable[int]]$SpGroupId = $null)
     if ($Script:GroupMembers.ContainsKey($GroupTitle)) { return }
     $members = @()
     try {
         if ($PrincipalType -eq "SP Group") {
+            # ── Groupe SharePoint : membres via PnP ──
             $pnpMembers = Get-PnPGroupMember -Identity $GroupTitle -ErrorAction SilentlyContinue
             foreach ($m in $pnpMembers) {
-                $members += [PSCustomObject]@{ name=$m.Title; email=$m.Email; login=$m.LoginName; type="User" }
+                # Un membre de groupe SP peut lui-meme etre une revendication (claim) representant
+                # tout le groupe AAD -> resoudre recursivement via Graph.
+                # IMPORTANT : le suffixe "_o" a la fin du GUID indique specifiquement la revendication
+                # "proprietaires du groupe" (utilisee par le groupe SP "Owners" d un site Team-connecte).
+                # Sans ce suffixe, la revendication represente "membres du groupe". Ne pas distinguer
+                # les deux fait que le groupe Owners affiche a tort les MEMBRES du groupe M365.
+                if ($m.LoginName -match 'c:0t\.c\|tenant\|([0-9a-fA-F\-]{36})(_o)?' -or
+                    $m.LoginName -match 'c:0o\.c\|federateddirectoryclaimprovider\|([0-9a-fA-F\-]{36})(_o)?') {
+                    $nestedId      = $Matches[1]
+                    $isOwnerClaim  = [bool]$Matches[2]  # "_o" present -> revendication proprietaires
+                    if ($isOwnerClaim) {
+                        $nestedResult = Get-AadGroupOwnersViaGraph -GroupId $nestedId
+                    } else {
+                        $nestedResult = Get-AadGroupMembersViaGraph -GroupId $nestedId
+                    }
+                    $nested = @($nestedResult.Members)
+                    foreach ($nm in $nested) { $members += $nm }
+                    if ($nested.Count -eq 0) {
+                        # Garder au moins le groupe comme entree si resolution impossible
+                        $suffix = if ($nestedResult.Orphaned) { " (groupe AAD supprime)" } else { "" }
+                        $members += [PSCustomObject]@{ name="$($m.Title)$suffix"; email=$m.Email; login=$m.LoginName; type="Group" }
+                    }
+                } else {
+                    # Filtrer le compte systeme SharePoint (SHAREPOINT\system), ajoute automatiquement
+                    # aux groupes Owners mais qui n est pas un vrai proprietaire humain.
+                    if ($m.LoginName -notmatch 'SHAREPOINT\\system' -and $m.Title -ne 'System Account') {
+                        $members += [PSCustomObject]@{ name=$m.Title; email=$m.Email; login=$m.LoginName; type="User" }
+                    }
+                }
+            }
+
+            # ── Fallback Team site : le groupe SP Owners/Members d un site connecte a une
+            # equipe M365 est une coquille vide (Get-PnPGroupMember renvoie 0, sans erreur).
+            # Le vrai membership vit dans le groupe M365 associe -> on bascule sur Graph.
+            #
+            # IMPORTANT : le role (Owner/Member/Visitor) est determine par comparaison d ID
+            # avec les groupes associes officiels du site (AssociatedOwnerGroup, etc.), PAS
+            # par une regex sur le titre - qui echoue sur les tenants non-anglophones
+            # (ex: "Proprietaires"/"Membres"/"Visiteurs" en francais).
+            if ($members.Count -eq 0 -and $Script:CurrentSiteGroupId) {
+                Write-Log "  Diagnostic '$GroupTitle' : SpGroupId=$SpGroupId Owner=$($Script:CurrentOwnerGroupId) Member=$($Script:CurrentMemberGroupId) Visitor=$($Script:CurrentVisitorGroupId)" -Level INFO
+                if ($SpGroupId -and $Script:CurrentOwnerGroupId -and $SpGroupId -eq $Script:CurrentOwnerGroupId) {
+                    Write-Log "  '$GroupTitle' vide via PnP - fallback Graph (owners) sur le groupe M365 du site" -Level INFO
+                    $graphResult = Get-AadGroupOwnersViaGraph -GroupId $Script:CurrentSiteGroupId
+                    $members = @($graphResult.Members)
+                    if ($graphResult.Orphaned) { Write-Log "  Groupe M365 introuvable (supprime ?) : $Script:CurrentSiteGroupId" -Level WARN }
+                } elseif ($SpGroupId -and $Script:CurrentMemberGroupId -and $SpGroupId -eq $Script:CurrentMemberGroupId) {
+                    Write-Log "  '$GroupTitle' vide via PnP - fallback Graph (members) sur le groupe M365 du site" -Level INFO
+                    $graphResult = Get-AadGroupMembersViaGraph -GroupId $Script:CurrentSiteGroupId
+                    $members = @($graphResult.Members)
+                    if ($graphResult.Orphaned) { Write-Log "  Groupe M365 introuvable (supprime ?) : $Script:CurrentSiteGroupId" -Level WARN }
+                } elseif ($SpGroupId -and $Script:CurrentVisitorGroupId -and $SpGroupId -eq $Script:CurrentVisitorGroupId) {
+                    # Le groupe Visitors n a pas d equivalent dans un groupe M365 - il est
+                    # legitimement vide sur un Team site. On ne bascule PAS sur Graph ici :
+                    # Get-PnPGroupMember a deja correctement renvoye 0 membre.
+                    Write-Log "  '$GroupTitle' (Visitors) vide - normal sur un site Team-connecte, pas de fallback" -Level INFO
+                } else {
+                    # SpGroupId absent ou ne correspond a aucun groupe associe connu :
+                    # ne pas deviner - on ne fait PAS de fallback pour eviter d afficher
+                    # les mauvais membres sous le mauvais groupe.
+                    Write-Log "  '$GroupTitle' vide via PnP - role non identifie, pas de fallback Graph" -Level INFO
+                }
+            }
+        } elseif ($PrincipalType -eq "Security Group") {
+            # ── Groupe AAD : extraire le GUID du LoginName et interroger Graph ──
+            # Formats : c:0t.c|tenant|<guid>  (groupe de securite)
+            #           c:0o.c|federateddirectoryclaimprovider|<guid>    (groupe M365)
+            #           c:0o.c|federateddirectoryclaimprovider|<guid>_o  (proprietaires M365)
+            $groupId = $null
+            if ($LoginName -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
+                $groupId = $Matches[1]
+            }
+            if ($groupId) {
+                # Forcer le tableau : un retour vide serait sinon deroule en $null par PS
+                $graphResult = Get-AadGroupMembersViaGraph -GroupId $groupId
+                $members     = @($graphResult.Members)
+                if ($graphResult.Orphaned) {
+                    # Groupe supprime d AAD mais encore reference dans SharePoint :
+                    # une permission fantome - info d audit utile !
+                    Write-Log "  Groupe ORPHELIN detecte : '$GroupTitle' (supprime d Azure AD, permission a nettoyer)" -Level WARN
+                    $members = @([PSCustomObject]@{
+                        name  = "(Groupe supprime d Azure AD - permission orpheline a nettoyer)"
+                        email = ""
+                        login = $LoginName
+                        type  = "Orphaned"
+                    })
+                }
+            }
+            if (-not $groupId) {
+                Write-Log "  GUID introuvable dans le LoginName de '$GroupTitle'" -Level WARN
             }
         }
-    } catch { }
+    } catch {
+        Write-Log "  Erreur membres du groupe '$GroupTitle' : $_" -Level WARN
+    }
     $Script:GroupMembers[$GroupTitle] = $members
+}
+
+function Get-AadGroupMembersViaGraph {
+    <#
+        Resout les membres d un groupe Azure AD via Microsoft Graph.
+        Utilise transitiveMembers pour inclure les membres des groupes imbriques.
+        Requiert la permission Graph GroupMember.Read.All (application).
+        Retourne @{ Members = [tableau]; Orphaned = [bool] }
+        Orphaned = true si le groupe n existe plus dans AAD (404).
+    #>
+    param([string]$GroupId)
+    $result   = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $orphaned = $false
+    try {
+        # transitiveMembers = membres directs + membres des sous-groupes (ideal pour audit)
+        $url = "https://graph.microsoft.com/v1.0/groups/$GroupId/transitiveMembers?`$select=displayName,mail,userPrincipalName&`$top=999"
+        while ($url) {
+            $resp = Invoke-PnPGraphMethod -Url $url -Method Get -ErrorAction Stop
+            $vals = if ($resp.PSObject.Properties['value']) { @($resp.value) } else { @() }
+            foreach ($m in $vals) {
+                # Ne garder que les utilisateurs ; les groupes imbriques sont deja aplatis
+                $odataType = if ($m.PSObject.Properties['@odata.type']) { $m.'@odata.type' } else { '' }
+                if ($odataType -like '*user*' -or -not $odataType) {
+                    $result.Add([PSCustomObject]@{
+                        name  = $m.displayName
+                        email = $(if ($m.mail) { $m.mail } else { $m.userPrincipalName })
+                        login = $m.userPrincipalName
+                        type  = "User"
+                    })
+                }
+            }
+            # Pagination Graph
+            $url = if ($resp.PSObject.Properties['@odata.nextLink']) { $resp.'@odata.nextLink' } else { $null }
+        }
+    } catch {
+        $msg = "$_"
+        if ($msg -match 'does not exist|Request_ResourceNotFound|404') {
+            # Groupe supprime d AAD - reference orpheline dans SharePoint
+            $orphaned = $true
+        } else {
+            Write-Log "  Graph transitiveMembers KO pour $GroupId : $_" -Level WARN
+        }
+    }
+    return @{ Members = @($result); Orphaned = $orphaned }
+}
+
+function Get-AadGroupOwnersViaGraph {
+    <#
+        Resout les proprietaires d un groupe Azure AD via Microsoft Graph.
+        Utilise pour le groupe "Owners" d un site connecte a une equipe/groupe M365.
+        Requiert la permission Graph GroupMember.Read.All (application).
+        Retourne @{ Members = [tableau]; Orphaned = [bool] }
+    #>
+    param([string]$GroupId)
+    $result   = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $orphaned = $false
+    try {
+        $url = "https://graph.microsoft.com/v1.0/groups/$GroupId/owners?`$select=displayName,mail,userPrincipalName&`$top=999"
+        while ($url) {
+            $resp = Invoke-PnPGraphMethod -Url $url -Method Get -ErrorAction Stop
+            $vals = if ($resp.PSObject.Properties['value']) { @($resp.value) } else { @() }
+            foreach ($m in $vals) {
+                $result.Add([PSCustomObject]@{
+                    name  = $m.displayName
+                    email = $(if ($m.mail) { $m.mail } else { $m.userPrincipalName })
+                    login = $m.userPrincipalName
+                    type  = "User"
+                })
+            }
+            $url = if ($resp.PSObject.Properties['@odata.nextLink']) { $resp.'@odata.nextLink' } else { $null }
+        }
+    } catch {
+        $msg = "$_"
+        if ($msg -match 'does not exist|Request_ResourceNotFound|404') {
+            $orphaned = $true
+        } else {
+            Write-Log "  Graph owners KO pour $GroupId : $_" -Level WARN
+        }
+    }
+    return @{ Members = @($result); Orphaned = $orphaned }
 }
 
 function Get-SPPermissions {
@@ -553,7 +725,18 @@ function Get-SPPermissions {
 
             # Charger membres pour les groupes (pas pour les liens de partage)
             if ($type -in @("SP Group", "Security Group")) {
-                Get-GroupMembers -GroupTitle $ra.Member.Title -LoginName $login -PrincipalType $type
+                $groupId = $null
+                if ($type -eq "SP Group") {
+                    try {
+                        # Id n est pas toujours charge automatiquement sur RoleAssignment.Member -
+                        # on force sa recuperation explicitement plutot que de supposer qu il est present.
+                        Get-PnPProperty -ClientObject $ra.Member -Property Id -ErrorAction Stop | Out-Null
+                        $groupId = [int]$ra.Member.Id
+                    } catch {
+                        Write-Log "  Impossible de lire Id du groupe '$($ra.Member.Title)' : $_" -Level WARN
+                    }
+                }
+                Get-GroupMembers -GroupTitle $ra.Member.Title -LoginName $login -PrincipalType $type -SpGroupId $groupId
             }
 
             $principalName = if ($shareType) { $shareType } else { $ra.Member.Title }
@@ -581,6 +764,56 @@ function Invoke-ScanSite {
         $web = Get-PnPWeb -Includes Title, HasUniqueRoleAssignments, RoleAssignments, Url
         $siteName = $web.Title
         Write-Log "Site: $siteName" -Level OK
+
+        # Detecter si le site est connecte a une equipe/groupe M365 (Team site).
+        # Dans ce cas, les groupes SP Owners/Members/Visitors sont des "coquilles" vides -
+        # le vrai membership vit dans le groupe M365 associe (via Graph).
+        $Script:CurrentSiteGroupId    = $null
+        $Script:CurrentOwnerGroupId   = $null
+        $Script:CurrentMemberGroupId  = $null
+        $Script:CurrentVisitorGroupId = $null
+        try {
+            $siteInfo = Get-PnPSite -Includes GroupId -ErrorAction SilentlyContinue
+            if ($siteInfo -and $siteInfo.GroupId -and $siteInfo.GroupId -ne [Guid]::Empty) {
+                $Script:CurrentSiteGroupId = $siteInfo.GroupId.ToString()
+                Write-Log "  Site connecte a un groupe M365/Team : $Script:CurrentSiteGroupId" -Level INFO
+            }
+            # Identifier les 3 groupes associes PAR ID (fiable, independant de la langue du tenant -
+            # un titre "Owners" en anglais ou "Proprietaires" en francais ne peut pas etre devine par regex).
+            # IMPORTANT : le .Id des objets imbriques (AssociatedOwnerGroup, etc.) n est PAS charge
+            # par un simple -Includes AssociatedOwnerGroup - il faut la notation pointee "Groupe.Id".
+            # Chaque groupe est recupere dans son propre try/catch pour qu un echec sur l un
+            # n empeche pas la resolution des deux autres.
+            try {
+                $webAssoc = Get-PnPWeb -Includes `
+                    "AssociatedOwnerGroup.Id", "AssociatedOwnerGroup.Title", `
+                    "AssociatedMemberGroup.Id", "AssociatedMemberGroup.Title", `
+                    "AssociatedVisitorGroup.Id", "AssociatedVisitorGroup.Title" `
+                    -ErrorAction Stop
+
+                try {
+                    if ($webAssoc.AssociatedOwnerGroup -and $webAssoc.AssociatedOwnerGroup.Id) {
+                        $Script:CurrentOwnerGroupId = [int]$webAssoc.AssociatedOwnerGroup.Id
+                    }
+                } catch { Write-Log "  Impossible de lire AssociatedOwnerGroup.Id : $_" -Level WARN }
+
+                try {
+                    if ($webAssoc.AssociatedMemberGroup -and $webAssoc.AssociatedMemberGroup.Id) {
+                        $Script:CurrentMemberGroupId = [int]$webAssoc.AssociatedMemberGroup.Id
+                    }
+                } catch { Write-Log "  Impossible de lire AssociatedMemberGroup.Id : $_" -Level WARN }
+
+                try {
+                    if ($webAssoc.AssociatedVisitorGroup -and $webAssoc.AssociatedVisitorGroup.Id) {
+                        $Script:CurrentVisitorGroupId = [int]$webAssoc.AssociatedVisitorGroup.Id
+                    }
+                } catch { Write-Log "  Impossible de lire AssociatedVisitorGroup.Id : $_" -Level WARN }
+
+                Write-Log "  Groupes associes - Owner:$($Script:CurrentOwnerGroupId) Member:$($Script:CurrentMemberGroupId) Visitor:$($Script:CurrentVisitorGroupId)" -Level INFO
+            } catch {
+                Write-Log "  Impossible de recuperer les groupes associes du site : $_" -Level WARN
+            }
+        } catch { }
 
         $sitePerms = Get-SPPermissions -SecurableObject $web
 
